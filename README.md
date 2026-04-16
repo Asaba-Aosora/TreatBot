@@ -6,24 +6,35 @@
 
 ## 🚀 快速开始
 
-### 三步启动（5分钟）
+> ⚠️ **提示**：OCR模块还在开发中，目前建议使用Web表单或直接输入患者信息的方式进行试验匹配。
+
+### 方案A：Web表单输入（推荐）⭐
 
 ```bash
-# 1️⃣  启动Ollama服务（保持开启）
-ollama serve
-
-# 2️⃣  新开终端，运行OCR识别
 cd scripts/
-python run_ocr.py
-
-# 3️⃣  【可选】Web演示服务
 python demo_server.py
-# 打开浏览器访问 http://127.0.0.1:8000/
+# 打开浏览器：http://127.0.0.1:8000/
+# 在表单中填写患者信息 → 实时查看匹配结果
 ```
 
-**预期输出**：`./output_patients/patient_trial_matches.json` - 匹配结果
+### 方案B：Python脚本直接输入
 
-📚 详细指南见：[docs/QUICK_START.md](docs/QUICK_START.md) 和 [docs/OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)
+```bash
+cd scripts/
+# 编辑 run_match.py 中的患者信息
+python run_match.py
+# 输出：../output_patients/patient_trial_matches.html
+```
+
+### 方案C：OCR识别（开发中）🚧
+
+```bash
+# 【注意】OCR识别精度待改进，目前不推荐
+cd scripts/
+python run_ocr.py
+```
+
+📚 详细指南见：[docs/QUICK_START.md](docs/QUICK_START.md)
 
 ---
 
@@ -71,7 +82,7 @@ python demo_server.py
 │   └── demo_server.py                    # ▶ Web服务（表单输入+实时匹配）
 │
 ├── codes/                                # 【核心代码】业务逻辑模块
-│   ├── ocr_ollama.py                     # ✅ OCR识别 + 结构化提取
+│   ├── ocr_ollama.py                     # ⏳ OCR识别 + 结构化提取（开发中）
 │   ├── trial_matcher.py                  # ✅ 患者-试验匹配引擎
 │   └── __init__.py
 │
@@ -111,19 +122,32 @@ python demo_server.py
 
 ## ✅ 已完成的核心功能
 
-### 1️⃣ 患者病历OCR识别 ✅
+### 1️⃣ 患者病历OCR识别 ⏳ (开发中)
 **文件**: `codes/ocr_ollama.py` + `scripts/run_ocr.py`
 
-- 支持：PDF → 分页图片 → Ollama视觉识别 → 文本提取 → 结构化提取
-- 使用本地Ollama视觉模型（完全离线，零成本）
-- 支持模型：llava:7b（推荐） / qwen-vl / minicpm-v
-- 输出：结构化患者JSON（姓名、年龄、诊断、既往治疗、ECOG、治疗线数等）
+**当前状态**:
+- ❌ 免费模型识别效果差：llava:7b、qwen-vl 等本地模型对医疗病历的识别准确率不理想
+- ❌ 实际测试中无法准确提取结构化数据
+- ✅ 已完成：PDF → 分页图片 的转换流程
+- ✅ 已完成：与Ollama API的调用框架
 
-**使用**:
-```bash
-cd scripts/
-python run_ocr.py
-```
+**后续改进方向**:
+1. **改用云端模型**（推荐）：
+   - 集成硅基流动的 `liuhaotian/llava-1.6-7b` 或更强的模型
+   - 集成GPT-4V或Claude3的视觉能力
+   - 虽然需要付费，但识别准确率 >95%
+
+2. **优化提示词**：
+   - 针对医疗病历设计更精准的OCR提示词
+   - 增加医学术语识别
+
+3. **混合方案**：
+   - 先用本地模型快速识别，再用LLM优化
+   - 对低信度结果请求人工确认
+
+**当前可用的替代方案**：
+- 【推荐】直接在 `scripts/run_match.py` 中手填患者信息
+- 【推荐】使用 Web表单 `scripts/demo_server.py` 输入患者数据
 
 **输出示例**:
 ```json
@@ -338,13 +362,42 @@ SILICONFLOW_API_KEY=sk-...
 
 ## 🎯 使用示例
 
-### 场景1：自动OCR识别
+### 场景1：Web表单输入（推荐 ⭐）
+
+```bash
+cd scripts/
+python demo_server.py
+
+# 打开浏览器：http://127.0.0.1:8000/
+# 步骤：
+# 1. 在表单中填写患者基本信息（诊断、分期、年龄等）
+# 2. 设置地理位置
+# 3. 点击提交
+# 4. 实时获得匹配的临床试验列表和详细信息
+```
+
+### 场景2：Python脚本输入
+
+```bash
+cd scripts/
+# 编辑 run_match.py 中的 main() 函数
+# 修改 build_patient_input() 中的患者信息参数
+python run_match.py
+
+# 输出files：
+# - ../output_patients/patient_trial_matches.json  (匹配结果JSON)
+# - ../output_patients/patient_trial_matches.html  (可视化报告)
+```
+
+### 场景3：OCR识别（开发中 🚧）
+
+> ⚠️ **当前状态**：OCR模块精度不足，暂不推荐使用。计划改用云端模型解决。
 
 ```bash
 # 步骤1：启动Ollama（后台保持运行）
 ollama serve &
 
-# 步骤2：运行OCR
+# 步骤2：运行OCR（目前效果不理想）
 cd scripts/
 python run_ocr.py
 
@@ -362,24 +415,15 @@ python run_match.py
 # 输出: ../output_patients/patient_trial_matches.html
 ```
 
-### 场景3：Web表单演示
-
-```bash
-cd scripts/
-python demo_server.py
-
-# 打开浏览器：http://127.0.0.1:8000/
-# 填写表单，实时查看匹配结果
-```
-
 ---
 
 ## 🔄 下一步开发计划
 
-- [ ] 集成云端LLM进行更精准的入组条件解析
+- [ ] **【优先】改进OCR识别** - 集成云端模型（GPT-4V / Claude 3 / 硅基流动API）
 - [ ] 支持排除条件的智能检查
 - [ ] 患者多疾病标签的优先级排序
 - [ ] 生物标志物智能匹配
+- [ ] 集成云端LLM进行更精准的入组条件解析
 - [ ] 数据库集成（替代JSON存储）
 - [ ] 微信小程序前端
 - [ ] 医生端管理系统
