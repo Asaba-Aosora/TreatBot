@@ -1,12 +1,18 @@
 import json
+import os
+import sys
 import urllib.parse
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
+# 添加父目录到Python路径，以便导入codes和run_match模块
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from codes.trial_matcher import build_patient_input, load_trials, rank_trials
 from run_match import render_html, save_html
 
-ROOT_DIR = Path(__file__).resolve().parent
+ROOT_DIR = PROJECT_ROOT
 TRIAL_JSON_PATH = ROOT_DIR / 'original_data' / 'clinical_trials' / 'trials_structured.json'
 OUTPUT_DIR = ROOT_DIR / 'output_patients'
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -28,7 +34,9 @@ def parse_biomarkers(value):
 class DemoHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path in ('', '/', '/index.html'):
-            self.path = '/demo_input.html'
+            self.path = '/web/demo_input.html'
+        elif self.path == '/demo_input.html':
+            self.path = '/web/demo_input.html'
         return super().do_GET()
 
     def do_POST(self):
@@ -78,9 +86,14 @@ class DemoHandler(SimpleHTTPRequestHandler):
 
 
 if __name__ == '__main__':
+    os.chdir(str(ROOT_DIR))
+
     host = '127.0.0.1'
     port = 8000
-    server = HTTPServer((host, port), DemoHandler)
+    server = HTTPServer(
+        (host, port),
+        lambda *args, **kwargs: DemoHandler(*args, directory=str(ROOT_DIR), **kwargs)
+    )
     print(f'Demo server running at http://{host}:{port}/')
     print('打开浏览器访问输入页面，填写后提交即可查看匹配结果。')
     server.serve_forever()
