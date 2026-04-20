@@ -2,6 +2,7 @@
 pdf2image>=1.16.3
 pillow>=9.0.0
 requests>=2.28.0
+openai>=1.0.0
 
 # PDF processing
 PyPDF2>=3.0.0
@@ -15,14 +16,22 @@ pdf2image>=1.16.3
 
 # Web server
 Flask>=2.0.0
+fastapi>=0.115.0
+uvicorn>=0.30.0
+pydantic>=2.7.0
 
 # Utilities
 python-dotenv>=0.19.0
 
-# Optional: 硅基流动 API (用于云端OCR和LLM，如果使用云服务)
-# 官网: https://cloud.siliconflow.cn
-# 需要注册账户并获取API Key
+# Cloud OCR APIs
+# 豆包 (Doubao) - 推荐用于医学检验报告
+# 官网: https://www.volcengine.com/product/doubao
+# 需要注册并获取API Key
 
-# Optional: Ollama 本地运行
-# 如果使用本地 Ollama 模型 (llava:7b 等)
-# 需要先安装 Ollama: https://ollama.ai
+# Kimi
+# 官网: https://platform.moonshot.cn/
+# 需要注册并获取API Key
+
+# 阿里云OCR
+# 官网: https://www.aliyun.com/product/ai/ocr
+# 需要注册并获取AppCode

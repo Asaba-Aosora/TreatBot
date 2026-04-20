@@ -2,7 +2,14 @@ import json
 import re
 from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from codes.lab_lexicon import METRIC_ALIASES as LEXICON_METRICS
+from codes.lab_normalize import attach_lab_observations
+from codes.lab_rules import evaluate_lab_rule_clauses
+from codes.trial_parse import enrich_parsed_conditions
+
+MATCHER_VERSION = "matcher_layers_v1"
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -316,6 +323,110 @@ def extract_lines_min(text: str) -> Optional[int]:
     return min(candidates) if candidates else None
 
 
+LAB_ITEM_ALIASES = {
+    "白细胞": ["白细胞", "wbc", "white blood cell"],
+    "中性粒细胞": ["中性粒细胞", "anc", "neutrophil"],
+    "血小板": ["血小板", "plt", "platelet"],
+    "血红蛋白": ["血红蛋白", "hb", "hemoglobin"],
+    "总胆红素": ["总胆红素", "tbil", "bilirubin"],
+    "肌酐": ["肌酐", "creatinine", "cr"],
+    "alt": ["alt", "谷丙转氨酶"],
+    "ast": ["ast", "谷草转氨酶"],
+}
+
+
+def _normalize_lab_name(name: str) -> str:
+    n = normalize_text(name)
+    for canonical, aliases in LAB_ITEM_ALIASES.items():
+        if any(normalize_text(alias) in n for alias in aliases):
+            return canonical
+    return n
+
+
+def extract_lab_requirements(text: str) -> Dict[str, Dict[str, Optional[float]]]:
+    reqs: Dict[str, Dict[str, Optional[float]]] = {}
+    for canonical, aliases in LAB_ITEM_ALIASES.items():
+        alias_pattern = "|".join(re.escape(alias) for alias in aliases)
+        # 示例: 白细胞 >=3.0, 肌酐 < 1.5
+        for match in re.finditer(rf"(?:{alias_pattern}).{{0,10}}([<>≤≥]=?)\s*(\d+(?:\.\d+)?)", text, re.IGNORECASE):
+            op = match.group(1)
+            val = float(match.group(2))
+            item_req = reqs.setdefault(canonical, {"min": None, "max": None})
+            if op in (">", ">=", "≥"):
+                item_req["min"] = max(item_req["min"], val) if item_req["min"] is not None else val
+            elif op in ("<", "<=", "≤"):
+                item_req["max"] = min(item_req["max"], val) if item_req["max"] is not None else val
+    return reqs
+
+
+def _safe_float(value: Optional[str]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return None
+
+
+def _metric_id_to_legacy_lab_key(metric_id: str) -> str:
+    for alias in LEXICON_METRICS.get(metric_id, []):
+        if any("\u4e00" <= ch <= "\u9fff" for ch in alias):
+            return alias
+    return metric_id
+
+
+def evaluate_lab_requirements(
+    patient: Dict, lab_requirements: Dict[str, Dict[str, Optional[float]]]
+) -> Tuple[bool, List[str], List[str]]:
+    """返回 (无明确数值违反, 违反说明列表, 缺失指标列表)。缺失不视为硬失败。"""
+    if not lab_requirements:
+        return True, [], []
+    patient_labs = patient.get("lab_results") or []
+    patient_map = {}
+    for item in patient_labs:
+        lab_name = _normalize_lab_name(item.get("item", ""))
+        patient_map[lab_name] = _safe_float(item.get("value"))
+    for obs in patient.get("lab_observations") or []:
+        mid = obs.get("metric_id")
+        v = obs.get("value_num")
+        if mid and isinstance(v, (int, float)):
+            key = _normalize_lab_name(_metric_id_to_legacy_lab_key(str(mid)))
+            if key not in patient_map or patient_map[key] is None:
+                patient_map[key] = float(v)
+
+    violations: List[str] = []
+    missing: List[str] = []
+    for key, req in lab_requirements.items():
+        value = patient_map.get(key)
+        if value is None:
+            missing.append(key)
+            continue
+        req_min = req.get("min")
+        req_max = req.get("max")
+        if req_min is not None and value < req_min:
+            violations.append(f"{key}低于阈值({value} < {req_min})")
+        if req_max is not None and value > req_max:
+            violations.append(f"{key}高于阈值({value} > {req_max})")
+    return len(violations) == 0, violations, missing
+
+
+def _tokenize_for_semantic(text: str) -> List[str]:
+    norm = normalize_text(text)
+    if not norm:
+        return []
+    return [norm[i : i + 2] for i in range(max(0, len(norm) - 1))]
+
+
+def semantic_similarity(query: str, text: str) -> float:
+    q_tokens = set(_tokenize_for_semantic(query))
+    t_tokens = set(_tokenize_for_semantic(text))
+    if not q_tokens or not t_tokens:
+        return 0.0
+    inter = len(q_tokens & t_tokens)
+    union = len(q_tokens | t_tokens)
+    return inter / union if union else 0.0
+
+
 def simple_label_match(patient_diag: str, trial_labels: List[str]) -> bool:
     patient_norm = normalize_text(patient_diag)
     if not patient_norm:
@@ -372,6 +483,7 @@ def parse_trial_condition(trial: Dict) -> Dict:
     gender = extract_gender(text)
     ecog_min, ecog_max = extract_ecog(text)
     treatment_lines_min = extract_lines_min(text)
+    lab_requirements = extract_lab_requirements(text)
 
     return {
         'age_min': age_min,
@@ -380,6 +492,7 @@ def parse_trial_condition(trial: Dict) -> Dict:
         'ecog_min': ecog_min,
         'ecog_max': ecog_max,
         'treatment_lines_min': treatment_lines_min,
+        'lab_requirements': lab_requirements,
     }
 
 
@@ -391,12 +504,16 @@ def load_trials(json_path: str) -> List[Dict]:
         trials = json.load(f)
 
     for trial in trials:
-        trial['parsed_conditions'] = parse_trial_condition(trial)
+        base = parse_trial_condition(trial)
+        trial["parsed_conditions"] = enrich_parsed_conditions(trial, base)
         trial['labels'] = split_labels(trial.get('疾病三级标签', ''))
     return trials
 
 
 def match_trial(patient: Dict, trial: Dict) -> Dict:
+    if patient.get("lab_results") and not patient.get("lab_observations"):
+        attach_lab_observations(patient)
+
     patient_diag = patient.get('diagnosis') or patient.get('cancer_type') or ''
     labels = trial.get('labels', [])
     matching_labels = find_matching_labels(patient_diag, labels)
@@ -407,7 +524,13 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
     gender_pass = True
     ecog_pass = True
     treatment_lines_pass = True
-    reasons = []
+    lab_pass = True
+    reasons: List[str] = []
+    checks: List[Dict[str, Any]] = []
+    next_steps: List[str] = []
+    exclusion_triggered = False
+    inclusion_lab_failed = False
+    unknown_penalty = 0.0
 
     age = patient.get('age')
     if age is not None:
@@ -436,6 +559,34 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
             treatment_lines_pass = False
             reasons.append(f"治疗线数低于{condition['treatment_lines_min']}线")
 
+    inc_clauses = condition.get("inclusion_lab_clauses") or []
+    exc_clauses = condition.get("exclusion_lab_clauses") or []
+    if inc_clauses or exc_clauses:
+        checks, inclusion_lab_failed, exclusion_triggered, nxt = evaluate_lab_rule_clauses(
+            patient, inc_clauses, exc_clauses
+        )
+        next_steps.extend(nxt)
+        unknown_penalty = sum(1 for c in checks if c.get("status") == "unknown") * 2.0
+        reasons.extend(c.get("message", "") for c in checks if c.get("status") == "fail")
+        lab_pass = not inclusion_lab_failed and not exclusion_triggered
+    else:
+        lab_ok, violations, missing = evaluate_lab_requirements(
+            patient, condition.get("lab_requirements", {})
+        )
+        lab_pass = lab_ok
+        reasons.extend(violations)
+        unknown_penalty = len(missing) * 2.0
+        next_steps.extend(missing)
+        for m in missing:
+            checks.append(
+                {
+                    "metric_id": m,
+                    "field": "inclusion",
+                    "status": "unknown",
+                    "message": f"缺少化验指标: {m}",
+                }
+            )
+
     # 评分逻辑：疾病匹配是基础，不匹配则暂不推荐。
     base_score = 0.0
     if disease_match:
@@ -448,6 +599,9 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
         base_score += 10
     if treatment_lines_pass:
         base_score += 10
+    if lab_pass:
+        base_score += 10
+    base_score -= unknown_penalty
 
     location = patient.get('location')
     province = trial.get('研究中心所在省份', '')
@@ -472,6 +626,31 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
     # 找出最近的地点（用于HTML高亮）
     nearest_location = find_nearest_location(location, province, city)
 
+    patient_semantic_text = " ".join(
+        str(v)
+        for v in [
+            patient.get("diagnosis", ""),
+            patient.get("cancer_stage", ""),
+            " ".join(patient.get("biomarkers", []) or []),
+            " ".join(
+                str(o.get("metric_id", ""))
+                for o in (patient.get("lab_observations") or [])
+            )
+            or " ".join(item.get("item", "") for item in (patient.get("lab_results") or [])),
+        ]
+    )
+    trial_semantic_text = " ".join(
+        [
+            trial.get("入组条件", "") or "",
+            trial.get("排除条件", "") or "",
+            " ".join(labels),
+        ]
+    )
+    semantic_score = semantic_similarity(patient_semantic_text, trial_semantic_text)
+    base_score += semantic_score * 15.0
+
+    eligible = bool(disease_match and not exclusion_triggered and lab_pass)
+
     return {
         'trial_id': trial.get('项目编码'),
         'trial_name': trial.get('项目名称') or trial.get('研究中心所在医院') or trial.get('研究中心所在城市'),
@@ -482,9 +661,17 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
         'gender_pass': gender_pass,
         'ecog_pass': ecog_pass,
         'treatment_lines_pass': treatment_lines_pass,
+        'lab_pass': lab_pass,
+        'eligible': eligible,
+        'exclusion_triggered': exclusion_triggered,
+        'inclusion_lab_failed': inclusion_lab_failed,
+        'checks': checks,
+        'next_steps': list(dict.fromkeys(next_steps)),
+        'matcher_version': MATCHER_VERSION,
         'geo_rank': geo_rank,
         'geo_distance': geo_distance,
         'nearest_location': nearest_location,
+        'semantic_score': semantic_score,
         'score': base_score,
         'reasons': reasons,
         'trial': trial,
@@ -495,7 +682,7 @@ def rank_trials(patient: Dict, trials: List[Dict], top_n: int = 20) -> List[Dict
     matched = []
     for trial in trials:
         result = match_trial(patient, trial)
-        if result['disease_match']:
+        if result['disease_match'] and result.get('eligible', True):
             matched.append(result)
 
     matched.sort(key=lambda x: (-x['score'], x['geo_rank'], x.get('geo_distance', 99999)))
