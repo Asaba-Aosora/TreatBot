@@ -510,7 +510,7 @@ def load_trials(json_path: str) -> List[Dict]:
     return trials
 
 
-def match_trial(patient: Dict, trial: Dict) -> Dict:
+def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
     if patient.get("lab_results") and not patient.get("lab_observations"):
         attach_lab_observations(patient)
 
@@ -567,6 +567,11 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
         )
         next_steps.extend(nxt)
         unknown_penalty = sum(1 for c in checks if c.get("status") == "unknown") * 2.0
+        lab_fail_count = sum(
+            1
+            for c in checks
+            if c.get("field") == "inclusion" and c.get("status") == "fail"
+        )
         reasons.extend(c.get("message", "") for c in checks if c.get("status") == "fail")
         lab_pass = not inclusion_lab_failed and not exclusion_triggered
     else:
@@ -586,6 +591,7 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
                     "message": f"缺少化验指标: {m}",
                 }
             )
+        lab_fail_count = len(violations)
 
     # 评分逻辑：疾病匹配是基础，不匹配则暂不推荐。
     base_score = 0.0
@@ -649,7 +655,54 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
     semantic_score = semantic_similarity(patient_semantic_text, trial_semantic_text)
     base_score += semantic_score * 15.0
 
-    eligible = bool(disease_match and not exclusion_triggered and lab_pass)
+    mode = (match_mode or "strict").strip().lower()
+    if mode not in ("strict", "balanced"):
+        mode = "strict"
+
+    age_required_but_missing = condition.get("age_min") is not None and age is None
+    gender_required_but_missing = (
+        condition.get("gender") not in (None, "", "不限") and not gender
+    )
+    ecog_required_but_missing = (
+        (condition.get("ecog_min") is not None or condition.get("ecog_max") is not None)
+        and ecog is None
+    )
+    lines_required_but_missing = (
+        condition.get("treatment_lines_min") is not None and treatment_lines is None
+    )
+
+    if age_required_but_missing:
+        next_steps.append("补充年龄")
+    if gender_required_but_missing:
+        next_steps.append("补充性别")
+    if ecog_required_but_missing:
+        next_steps.append("补充ECOG评分")
+    if lines_required_but_missing:
+        next_steps.append("补充治疗线数")
+
+    hard_rule_pass = (
+        age_pass
+        and gender_pass
+        and ecog_pass
+        and treatment_lines_pass
+        and lab_pass
+        and not exclusion_triggered
+    )
+
+    if mode == "strict":
+        required_core_complete = not any(
+            [
+                age_required_but_missing,
+                gender_required_but_missing,
+                ecog_required_but_missing,
+                lines_required_but_missing,
+            ]
+        )
+        eligible = bool(disease_match and hard_rule_pass and required_core_complete)
+    else:
+        # 平衡模式：保留高召回，允许最多 1 条入组化验失败，便于后续人工复核。
+        lab_gate = (not exclusion_triggered) and (lab_pass or lab_fail_count <= 1)
+        eligible = bool(disease_match and lab_gate)
 
     return {
         'trial_id': trial.get('项目编码'),
@@ -668,6 +721,7 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
         'checks': checks,
         'next_steps': list(dict.fromkeys(next_steps)),
         'matcher_version': MATCHER_VERSION,
+        'match_mode': mode,
         'geo_rank': geo_rank,
         'geo_distance': geo_distance,
         'nearest_location': nearest_location,
@@ -678,10 +732,12 @@ def match_trial(patient: Dict, trial: Dict) -> Dict:
     }
 
 
-def rank_trials(patient: Dict, trials: List[Dict], top_n: int = 20) -> List[Dict]:
+def rank_trials(
+    patient: Dict, trials: List[Dict], top_n: int = 20, match_mode: str = "strict"
+) -> List[Dict]:
     matched = []
     for trial in trials:
-        result = match_trial(patient, trial)
+        result = match_trial(patient, trial, match_mode=match_mode)
         if result['disease_match'] and result.get('eligible', True):
             matched.append(result)
 
@@ -708,4 +764,27 @@ def build_patient_input(
         'location': location,
         'cancer_stage': cancer_stage,
         'biomarkers': biomarkers or [],
+    }
+
+
+def summarize_patient_data_quality(patient: Dict) -> Dict[str, Any]:
+    labs = patient.get("lab_results") or []
+    observations = patient.get("lab_observations") or []
+    genomics = patient.get("genomics_raw") or []
+    meta_rows = patient.get("_ocr_meta_unsorted") or []
+    unknown_status = sum(
+        1 for row in labs if str(row.get("status", "") or "") == "无法判断"
+    )
+    missing_core = [
+        field
+        for field in ("diagnosis", "age", "gender", "ecog", "treatment_lines", "location")
+        if not patient.get(field)
+    ]
+    return {
+        "lab_rows_total": len(labs),
+        "lab_observations_total": len(observations),
+        "genomics_rows_total": len(genomics),
+        "meta_rows_total": len(meta_rows),
+        "unknown_status_rows": unknown_status,
+        "missing_core_fields": missing_core,
     }

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 from codes.lab_lexicon import METRIC_ALIASES
 
@@ -41,7 +41,8 @@ def extract_lab_rule_clauses(text: str, field: str) -> List[Dict[str, Any]]:
         return []
     clauses: List[Dict[str, Any]] = []
     for m in re.finditer(
-        rf"(?P<metric>{_METRIC_RE}).{{0,20}}(?P<op>[<>≤≥]=?)\s*(?P<val>\d+(?:\.\d+)?)\s*(?:x?\s*(?:uln|正常上限|上限)|×\s*(?:uln|正常上限))?",
+        rf"(?P<metric>{_METRIC_RE}).{{0,20}}(?P<op>[<>≤≥]=?)\s*"
+        rf"(?P<val>\d+(?:\.\d+)?)\s*(?:x?\s*(?:uln|正常上限|上限)|×\s*(?:uln|正常上限))?",
         text,
         re.IGNORECASE,
     ):
@@ -57,7 +58,9 @@ def extract_lab_rule_clauses(text: str, field: str) -> List[Dict[str, Any]]:
                 "metric_id": metric_id,
                 "operator": op,
                 "threshold": val,
-                "relative_to_uln": "uln" in m.group(0).lower() or "正常上限" in m.group(0),
+                "relative_to_uln": (
+                    "uln" in m.group(0).lower() or "正常上限" in m.group(0)
+                ),
                 "field": field,
                 "severity": "must",
                 "evidence": span.strip(),
@@ -88,6 +91,44 @@ def _patient_metric_map(patient: Dict) -> Dict[str, float]:
     return out
 
 
+def _patient_metric_meta(patient: Dict) -> Dict[str, Dict[str, Any]]:
+    meta: Dict[str, Dict[str, Any]] = {}
+    for obs in patient.get("lab_observations") or []:
+        mid = str(obs.get("metric_id") or "")
+        if not mid:
+            continue
+        raw = obs.get("raw") or {}
+        meta[mid] = {
+            "unit_norm": str(obs.get("unit_norm") or ""),
+            "raw_unit": str(raw.get("unit") or ""),
+            "raw_range": str(raw.get("range") or ""),
+        }
+    return meta
+
+
+def _suspect_unit_mismatch(
+    metric_id: str,
+    patient_val: float,
+    threshold: float,
+    op: str,
+    meta: Dict[str, Any],
+) -> bool:
+    # 常见场景：试验写的是 xULN 倍数，但 OCR/解析得到绝对值且单位缺失，避免误判硬失败。
+    if op not in ("<", "<=", "≤"):
+        return False
+    if threshold > 5:
+        return False
+    raw_range = str(meta.get("raw_range") or "")
+    raw_unit = str(meta.get("raw_unit") or "")
+    unit_norm = str(meta.get("unit_norm") or "")
+    if not raw_range and not raw_unit and not unit_norm:
+        return False
+    if patient_val <= threshold * 8:
+        return False
+    # 对这些常见肝肾相关指标启用保护，避免误拒绝
+    return metric_id in {"cr", "tbil", "alt", "ast", "alb"}
+
+
 def _compare(op: str, patient_val: float, threshold: float) -> bool:
     if op == ">":
         return patient_val > threshold
@@ -113,6 +154,7 @@ def evaluate_lab_rule_clauses(
       next_steps: 建议补检的 metric_id
     """
     pmap = _patient_metric_map(patient)
+    pmeta = _patient_metric_meta(patient)
     checks: List[Dict[str, Any]] = []
     next_steps: List[str] = []
     inclusion_failed = False
@@ -150,6 +192,21 @@ def evaluate_lab_rule_clauses(
         ok = _compare(op, pv, thr)
         # 入组条件通常表达为下限或上限；这里按字面比较符解释
         if not ok:
+            if _suspect_unit_mismatch(mid, pv, thr, op, pmeta.get(mid, {})):
+                checks.append(
+                    {
+                        "metric_id": mid,
+                        "field": "inclusion",
+                        "status": "unknown",
+                        "message": "疑似单位不一致，转为待人工核对",
+                        "patient_value": pv,
+                        "threshold": thr,
+                        "operator": op,
+                        "evidence": clause.get("evidence"),
+                    }
+                )
+                next_steps.append(mid)
+                continue
             inclusion_failed = True
             checks.append(
                 {
@@ -219,4 +276,9 @@ def evaluate_lab_rule_clauses(
                 }
             )
 
-    return checks, inclusion_failed, exclusion_triggered, list(dict.fromkeys(next_steps))
+    return (
+        checks,
+        inclusion_failed,
+        exclusion_triggered,
+        list(dict.fromkeys(next_steps)),
+    )

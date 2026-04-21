@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from pdf2image import convert_from_path
 from openai import OpenAI
 
-from codes.lab_normalize import attach_lab_observations
+from codes.lab_normalize import attach_lab_observations, normalize_ocr_lab_payload
 
 # 加载环境变量
 load_dotenv()
@@ -908,6 +908,7 @@ def process_pdf_with_cloud_ocr(
         print(f"\n💾 提取患者信息...")
         full_text = "\n\n---页面分割---\n\n".join(all_texts)
         patient_info = PatientExtractor.extract_from_text(full_text, provider)
+        normalize_ocr_lab_payload(patient_info)
         attach_lab_observations(patient_info)
         issues.extend(PatientExtractor.validate_patient_info(patient_info))
 

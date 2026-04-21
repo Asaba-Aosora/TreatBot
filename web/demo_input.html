@@ -27,6 +27,10 @@
     .field-group.full { grid-column: 1 / -1; }
     .confirm-box { border-radius: 12px; padding: 14px 16px; background: #f7fbff; border: 1px solid #dce6ff; color: #2e4b74; }
     .metadata { margin-top: 12px; font-size: 13px; color: #555; }
+    .mode-switch { display: flex; gap: 12px; margin-bottom: 14px; }
+    .mode-switch button { width: auto; padding: 8px 14px; border-radius: 999px; }
+    .mode-switch button.active { background: #4f86ff; color: #fff; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
@@ -35,8 +39,20 @@
     <p class="lead">请填写匹配所需属性，系统会自动校验格式，并生成可复制的结构化患者输入。</p>
 
     <div class="panel">
+      <div class="mode-switch">
+        <button id="manualModeBtn" type="button" class="secondary active" onclick="switchMode('manual')">手动录入模式</button>
+        <button id="uploadModeBtn" type="button" class="secondary" onclick="switchMode('upload')">上传 OCR JSON 模式</button>
+      </div>
+
+      <div id="uploadOnlySection" class="field-group full hidden" style="margin-top:4px;">
+        <label for="jsonUpload">上传 OCR 结果 JSON 并直接匹配</label>
+        <input id="jsonUpload" type="file" accept=".json,application/json" />
+        <div class="hint">此模式无需填写下方表单。支持完整 OCR 输出（含 patient 字段）或仅 patient 对象。</div>
+        <button type="button" class="primary" style="margin-top:10px; width:auto;" onclick="runMatchFromJson()">上传并直接匹配</button>
+      </div>
+
       <form id="demoForm" method="post" action="/run_match">
-        <div class="row">
+        <div id="manualFormSection" class="row">
           <div class="field-group">
             <label for="diagnosis">癌症种类（诊断）</label>
             <input list="labelSuggestions" id="diagnosis" name="diagnosis" placeholder="例如：胆管癌、肝内胆管癌" />
@@ -107,6 +123,15 @@
           <datalist id="citySuggestions"></datalist>
           <button type="button" class="secondary" onclick="confirmLocation()" style="margin-top:12px; width:auto;">确认省市</button>
           <div id="locationStatus" class="confirm-box status">请选择省份并输入城市，再点击“确认省市”。</div>
+        </div>
+
+        <div class="field-group full">
+          <label for="matchMode">匹配模式</label>
+          <select id="matchMode" name="match_mode">
+            <option value="strict" selected>严格（推荐，精确率优先）</option>
+            <option value="balanced">平衡（召回优先）</option>
+          </select>
+          <div class="hint">严格模式会要求关键硬条件（年龄/性别/ECOG/治疗线数）满足后才入选。</div>
         </div>
 
         <div class="field-group full">
@@ -196,6 +221,30 @@
     const provinceSelect = document.getElementById('province');
     const cityDataList = document.getElementById('citySuggestions');
     const labelDataList = document.getElementById('labelSuggestions');
+    let currentMode = 'manual';
+
+    function switchMode(mode) {
+      currentMode = mode;
+      const manualBtn = document.getElementById('manualModeBtn');
+      const uploadBtn = document.getElementById('uploadModeBtn');
+      const uploadSection = document.getElementById('uploadOnlySection');
+      const manualSection = document.getElementById('manualFormSection');
+      const buttonRow = document.querySelector('.button-row');
+
+      if (mode === 'upload') {
+        manualBtn.classList.remove('active');
+        uploadBtn.classList.add('active');
+        uploadSection.classList.remove('hidden');
+        manualSection.classList.add('hidden');
+        buttonRow.classList.add('hidden');
+      } else {
+        uploadBtn.classList.remove('active');
+        manualBtn.classList.add('active');
+        uploadSection.classList.add('hidden');
+        manualSection.classList.remove('hidden');
+        buttonRow.classList.remove('hidden');
+      }
+    }
 
     function populateCitySuggestions(province) {
       cityDataList.innerHTML = '';
@@ -306,6 +355,7 @@
         .split(/[,，]+/)
         .map(item => item.trim())
         .filter(Boolean);
+      const matchMode = document.getElementById('matchMode').value || 'strict';
 
       const patient = {
         diagnosis,
@@ -315,6 +365,7 @@
         ecog: ecog || null,
         treatment_lines: treatmentLines,
         location: `${province}${city ? ' ' + city : ''}`,
+        match_mode: matchMode,
         biomarkers,
       };
 
@@ -340,7 +391,44 @@
       });
     }
 
+    async function runMatchFromJson() {
+      const fileInput = document.getElementById('jsonUpload');
+      const status = document.getElementById('message');
+      if (!fileInput.files || fileInput.files.length === 0) {
+        status.textContent = '请先选择 JSON 文件。';
+        status.className = 'status error';
+        return;
+      }
+      const file = fileInput.files[0];
+      try {
+        const text = await file.text();
+        const payload = JSON.parse(text);
+        const matchMode = document.getElementById('matchMode').value || 'strict';
+        const resp = await fetch('/run_match_json', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ payload, match_mode: matchMode }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) {
+          status.textContent = data.error || '上传匹配失败。';
+          status.className = 'status error';
+          return;
+        }
+        window.location.href = data.redirect || '/output_patients/patient_trial_matches.html';
+      } catch (err) {
+        status.textContent = 'JSON 解析失败，请确认文件格式。';
+        status.className = 'status error';
+      }
+    }
+
     document.getElementById('demoForm').addEventListener('submit', function(event) {
+      if (currentMode === 'upload') {
+        event.preventDefault();
+        document.getElementById('message').textContent = '当前为上传模式，请点击“上传并直接匹配”。';
+        document.getElementById('message').className = 'status error';
+        return;
+      }
       event.preventDefault();
       if (validateForm()) {
         this.submit();

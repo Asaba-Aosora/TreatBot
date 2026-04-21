@@ -9,7 +9,12 @@ import uuid
 
 from codes.lab_normalize import attach_lab_observations
 from codes.ocr_cloud import process_pdf_with_cloud_ocr
-from codes.trial_matcher import build_patient_input, load_trials, rank_trials
+from codes.trial_matcher import (
+    build_patient_input,
+    load_trials,
+    rank_trials,
+    summarize_patient_data_quality,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 TRIAL_JSON_PATH = PROJECT_ROOT / "original_data" / "clinical_trials" / "trials_structured.json"
@@ -41,6 +46,7 @@ class MatchRequest(BaseModel):
     cancer_stage: Optional[str] = None
     biomarkers: List[str] = Field(default_factory=list)
     lab_results: List[LabResultInput] = Field(default_factory=list)
+    match_mode: str = Field(default="strict", pattern="^(strict|balanced)$")
     top_n: int = 20
 
 
@@ -113,8 +119,15 @@ def match_trials(payload: MatchRequest):
     attach_lab_observations(patient)
 
     trials = load_trials(str(TRIAL_JSON_PATH))
-    matches = rank_trials(patient, trials, top_n=payload.top_n)
-    return {"patient": patient, "matches": matches}
+    matches = rank_trials(
+        patient, trials, top_n=payload.top_n, match_mode=payload.match_mode
+    )
+    return {
+        "patient": patient,
+        "match_mode": payload.match_mode,
+        "data_quality": summarize_patient_data_quality(patient),
+        "matches": matches,
+    }
 
 
 @app.post("/v1/feedback")

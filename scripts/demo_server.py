@@ -9,7 +9,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from codes.trial_matcher import build_patient_input, load_trials, rank_trials
+from codes.lab_normalize import attach_lab_observations, normalize_ocr_lab_payload
+from codes.trial_matcher import (
+    build_patient_input,
+    load_trials,
+    rank_trials,
+    summarize_patient_data_quality,
+)
 from run_match import render_html, save_html
 
 ROOT_DIR = PROJECT_ROOT
@@ -31,6 +37,11 @@ def parse_biomarkers(value):
     return [item.strip() for item in value.replace('，', ',').split(',') if item.strip()]
 
 
+def parse_match_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    return mode if mode in ("strict", "balanced") else "strict"
+
+
 class DemoHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path in ('', '/', '/index.html'):
@@ -40,6 +51,9 @@ class DemoHandler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_POST(self):
+        if self.path == '/run_match_json':
+            return self.handle_json_match()
+
         if self.path != '/run_match':
             return super().do_POST()
 
@@ -56,6 +70,7 @@ class DemoHandler(SimpleHTTPRequestHandler):
         province = form.get('province', [''])[0].strip()
         city = form.get('city', [''])[0].strip()
         biomarkers = parse_biomarkers(form.get('biomarkers', [''])[0])
+        match_mode = parse_match_mode(form.get('match_mode', ['strict'])[0])
 
         location = f"{province} {city}".strip()
 
@@ -69,20 +84,79 @@ class DemoHandler(SimpleHTTPRequestHandler):
             location=location,
             biomarkers=biomarkers,
         )
+        normalize_ocr_lab_payload(patient)
+        attach_lab_observations(patient)
 
-        trials = load_trials(str(TRIAL_JSON_PATH))
-        matches = rank_trials(patient, trials, top_n=20)
-
-        output_json_path = OUTPUT_DIR / 'patient_trial_matches.json'
-        with output_json_path.open('w', encoding='utf-8') as f:
-            json.dump({'patient': patient, 'matches': matches}, f, ensure_ascii=False, indent=2)
-
-        html_text = render_html(patient, matches)
-        save_html(OUTPUT_DIR, html_text)
+        self._run_and_persist(patient, match_mode)
 
         self.send_response(303)
         self.send_header('Location', '/output_patients/patient_trial_matches.html')
         self.end_headers()
+
+    def _run_and_persist(self, patient: dict, match_mode: str):
+        trials = load_trials(str(TRIAL_JSON_PATH))
+        matches = rank_trials(patient, trials, top_n=20, match_mode=match_mode)
+        data_quality = summarize_patient_data_quality(patient)
+
+        output_json_path = OUTPUT_DIR / 'patient_trial_matches.json'
+        with output_json_path.open('w', encoding='utf-8') as f:
+            json.dump(
+                {'patient': patient, 'match_mode': match_mode, 'data_quality': data_quality, 'matches': matches},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+        html_text = render_html(patient, matches, match_mode=match_mode, data_quality=data_quality)
+        save_html(OUTPUT_DIR, html_text)
+
+    def handle_json_match(self):
+        length = int(self.headers.get('Content-Length', 0))
+        body = self.rfile.read(length).decode('utf-8')
+        try:
+            payload = json.loads(body) if body else {}
+        except json.JSONDecodeError:
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': '上传内容不是有效 JSON'}, ensure_ascii=False).encode('utf-8'))
+            return
+
+        match_mode = parse_match_mode(str(payload.get('match_mode', 'strict')))
+        source = payload.get('payload') if isinstance(payload, dict) else {}
+        if not isinstance(source, dict):
+            source = {}
+        patient = source.get('patient') if isinstance(source.get('patient'), dict) else source
+        if not isinstance(patient, dict):
+            patient = {}
+
+        if not (patient.get('diagnosis') or patient.get('cancer_type')):
+            self.send_response(400)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(
+                json.dumps(
+                    {'error': 'JSON 中缺少 patient.diagnosis 或 cancer_type'},
+                    ensure_ascii=False,
+                ).encode('utf-8')
+            )
+            return
+
+        patient.setdefault('diagnosis', patient.get('cancer_type', ''))
+        patient.setdefault('biomarkers', [])
+        patient.setdefault('lab_results', [])
+        normalize_ocr_lab_payload(patient)
+        attach_lab_observations(patient)
+        self._run_and_persist(patient, match_mode)
+
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(
+            json.dumps(
+                {'ok': True, 'redirect': '/output_patients/patient_trial_matches.html'},
+                ensure_ascii=False,
+            ).encode('utf-8')
+        )
 
 
 if __name__ == '__main__':

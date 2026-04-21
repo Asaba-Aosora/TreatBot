@@ -8,7 +8,9 @@ from pathlib import Path
 from codes.trial_matcher import build_patient_input, load_trials, rank_trials
 
 
-def render_html(patient: dict, matches: list) -> str:
+def render_html(
+    patient: dict, matches: list, match_mode: str = "strict", data_quality: dict | None = None
+) -> str:
     patient_rows = []
     for key, label in [
         ('diagnosis', '诊断'),
@@ -25,11 +27,60 @@ def render_html(patient: dict, matches: list) -> str:
             value = '、'.join(value)
         patient_rows.append(f'<tr><th>{html.escape(label)}</th><td>{html.escape(str(value)) if value is not None else "-"}</td></tr>')
 
+    dq = data_quality or {}
+    quality_rows = [
+        ("lab_rows_total", "化验条目总数"),
+        ("lab_observations_total", "可计算化验项"),
+        ("genomics_rows_total", "基因条目数"),
+        ("meta_rows_total", "分流元数据条目"),
+        ("unknown_status_rows", "无法判断状态条目"),
+    ]
+    quality_html = "".join(
+        f"<tr><th>{html.escape(label)}</th><td>{html.escape(str(dq.get(key, '-')))}</td></tr>"
+        for key, label in quality_rows
+    )
+    missing_core = dq.get("missing_core_fields") or []
+    missing_core_text = "、".join(str(x) for x in missing_core) if missing_core else "无"
+
     match_items = []
     for idx, item in enumerate(matches, start=1):
         trial = item.get('trial', {})
         reasons = item.get('reasons', []) or []
         reasons_html = '<br>'.join(html.escape(r) for r in reasons) if reasons else '<span class="dim">无明显不符</span>'
+        next_steps = item.get('next_steps', []) or []
+        next_steps_html = '<br>'.join(html.escape(str(s)) for s in next_steps) if next_steps else '<span class="dim">无</span>'
+        checks = item.get('checks', []) or []
+        checks_rows = []
+        for check in checks:
+            metric = str(check.get('metric_id') or '-')
+            field_name = '入组' if check.get('field') == 'inclusion' else '排除'
+            status = str(check.get('status') or 'unknown')
+            patient_value = check.get('patient_value')
+            threshold = check.get('threshold')
+            operator = check.get('operator')
+            evidence = str(check.get('evidence') or '')
+            message = str(check.get('message') or '')
+            status_text = {'pass': '通过', 'fail': '未通过', 'unknown': '待核对'}.get(status, status)
+            patient_value_text = '-' if patient_value is None else str(patient_value)
+            threshold_text = '-'
+            if threshold is not None and operator:
+                threshold_text = f"{operator}{threshold}"
+            checks_rows.append(
+                "<tr>"
+                f"<td>{html.escape(field_name)}</td>"
+                f"<td>{html.escape(metric)}</td>"
+                f"<td>{html.escape(status_text)}</td>"
+                f"<td>{html.escape(patient_value_text)}</td>"
+                f"<td>{html.escape(threshold_text)}</td>"
+                f"<td>{html.escape(message or evidence or '-')}</td>"
+                "</tr>"
+            )
+        checks_table_html = (
+            "<table>"
+            "<tr><th>条款类型</th><th>指标</th><th>判定</th><th>患者值</th><th>阈值/规则</th><th>说明/证据</th></tr>"
+            + "".join(checks_rows)
+            + "</table>"
+        ) if checks_rows else "<p class='dim'>当前试验未抽取到可计算的细则条款。</p>"
         
         # 高亮最近的地点
         nearest = item.get('nearest_location')
@@ -71,7 +122,7 @@ def render_html(patient: dict, matches: list) -> str:
           <button class="toggle-btn" onclick="toggleDetail('detail-{idx}')">
             <div class="summary-left">
               <div class="trial-title">{idx}. {html.escape(item.get('trial_name') or item.get('trial_id') or '未知试验')}</div>
-              <div class="trial-meta">试验编码: {html.escape(str(item.get('trial_id')))} | 地理排序: {item.get('geo_rank')} | 距离: {geo_distance_text} km</div>
+              <div class="trial-meta">试验编码: {html.escape(str(item.get('trial_id')))} | 总分: {item.get('score', 0):.1f} | 地理排序: {item.get('geo_rank')} | 距离: {geo_distance_text} km</div>
               <div class="trial-meta location-meta">患者位置: {patient_location} → 研究中心: {summary_location}</div>
             </div>
           </button>
@@ -84,9 +135,16 @@ def render_html(patient: dict, matches: list) -> str:
             </div>
             <div class="detail-block">
               <h3>匹配结果</h3>
+              <p><strong>是否入选:</strong> {'✔ 入选' if item.get('eligible') else '✖ 未入选'}</p>
               <p><strong>疾病匹配:</strong> {'✔' if item.get('disease_match') else '✖'}</p>
+              <p><strong>硬规则通过:</strong> 年龄 {'✔' if item.get('age_pass') else '✖'} / 性别 {'✔' if item.get('gender_pass') else '✖'} / ECOG {'✔' if item.get('ecog_pass') else '✖'} / 治疗线数 {'✔' if item.get('treatment_lines_pass') else '✖'} / 化验 {'✔' if item.get('lab_pass') else '✖'}</p>
               <p><strong>地理得分:</strong> {item.get('geo_rank')} | <strong>距离:</strong> {geo_distance_text} km</p>
               <p><strong>匹配理由 / 问题:</strong> {reasons_html}</p>
+              <p><strong>建议补充:</strong> {next_steps_html}</p>
+            </div>
+            <div class="detail-block">
+              <h3>试验条件细则对照（含患者指标）</h3>
+              {checks_table_html}
             </div>
             <div class="detail-block">
               <h3>试验原始信息</h3>
@@ -138,9 +196,17 @@ def render_html(patient: dict, matches: list) -> str:
 <body>
   <div class="panel">
     <h1>患者匹配结果</h1>
-    <p>请点击每个试验展开详情。匹配结果保留原始试验信息，并对匹配通过情况进行了高亮。</p>
+    <p>匹配模式：<strong>{html.escape(match_mode)}</strong>。请点击每个试验展开详情。</p>
     <table>
       {''.join(patient_rows)}
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>输入数据质量</h2>
+    <table>
+      {quality_html}
+      <tr><th>缺失核心字段</th><td>{html.escape(missing_core_text)}</td></tr>
     </table>
   </div>
 
@@ -196,7 +262,7 @@ def main():
     with output_json_path.open('w', encoding='utf-8') as f:
         json.dump({'patient': patient, 'matches': matched}, f, ensure_ascii=False, indent=2)
 
-    html_text = render_html(patient, matched)
+    html_text = render_html(patient, matched, match_mode="strict")
     save_html(output_dir, html_text)
 
     print('已生成候选试验结果：', output_json_path)
