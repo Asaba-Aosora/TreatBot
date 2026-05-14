@@ -60,6 +60,8 @@ def render_html(
             operator = check.get('operator')
             evidence = str(check.get('evidence') or '')
             message = str(check.get('message') or '')
+            source = str(check.get('source') or 'regex')
+            confidence = float(check.get('confidence') or 0.0)
             status_text = {'pass': '通过', 'fail': '未通过', 'unknown': '待核对'}.get(status, status)
             patient_value_text = '-' if patient_value is None else str(patient_value)
             threshold_text = '-'
@@ -73,14 +75,35 @@ def render_html(
                 f"<td>{html.escape(patient_value_text)}</td>"
                 f"<td>{html.escape(threshold_text)}</td>"
                 f"<td>{html.escape(message or evidence or '-')}</td>"
+                f"<td>{html.escape(source)} / {confidence:.2f}</td>"
                 "</tr>"
             )
         checks_table_html = (
             "<table>"
-            "<tr><th>条款类型</th><th>指标</th><th>判定</th><th>患者值</th><th>阈值/规则</th><th>说明/证据</th></tr>"
+            "<tr><th>条款类型</th><th>指标</th><th>判定</th><th>患者值</th><th>阈值/规则</th><th>说明/证据</th><th>来源/置信度</th></tr>"
             + "".join(checks_rows)
             + "</table>"
         ) if checks_rows else "<p class='dim'>当前试验未抽取到可计算的细则条款。</p>"
+        review_items = item.get('review_items', []) or []
+        review_rows = []
+        for r in review_items:
+            if r.get('status') not in ('fail', 'unknown'):
+                continue
+            review_rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(r.get('priority', '-')))}</td>"
+                f"<td>{html.escape(str(r.get('field', '-')))}</td>"
+                f"<td>{html.escape(str(r.get('metric_id', '-')))}</td>"
+                f"<td>{html.escape(str(r.get('status', '-')))}</td>"
+                f"<td>{html.escape(str(r.get('message') or r.get('evidence') or '-'))}</td>"
+                "</tr>"
+            )
+        review_table_html = (
+            "<table>"
+            "<tr><th>优先级</th><th>条款类型</th><th>指标</th><th>状态</th><th>复核原因</th></tr>"
+            + "".join(review_rows)
+            + "</table>"
+        ) if review_rows else "<p class='dim'>当前无待人工复核条款。</p>"
         
         # 高亮最近的地点
         nearest = item.get('nearest_location')
@@ -145,6 +168,10 @@ def render_html(
             <div class="detail-block">
               <h3>试验条件细则对照（含患者指标）</h3>
               {checks_table_html}
+            </div>
+            <div class="detail-block">
+              <h3>人工复核优先队列</h3>
+              {review_table_html}
             </div>
             <div class="detail-block">
               <h3>试验原始信息</h3>

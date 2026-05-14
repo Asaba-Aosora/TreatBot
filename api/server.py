@@ -7,9 +7,10 @@ from pydantic import BaseModel, Field
 import time
 import uuid
 
-from codes.lab_normalize import attach_lab_observations
+from codes.lab_normalize import attach_lab_observations, normalize_ocr_lab_payload
 from codes.ocr_cloud import process_pdf_with_cloud_ocr
 from codes.trial_matcher import (
+    build_review_queue,
     build_patient_input,
     load_trials,
     rank_trials,
@@ -57,6 +58,8 @@ class FeedbackRequest(BaseModel):
     reason: Optional[str] = None
     doctor_id: Optional[str] = None
     context: Dict[str, Any] = Field(default_factory=dict)
+    review_action: Optional[str] = None
+    check: Dict[str, Any] = Field(default_factory=dict)
 
 
 @app.get("/health")
@@ -116,6 +119,7 @@ def match_trials(payload: MatchRequest):
         biomarkers=payload.biomarkers,
     )
     patient["lab_results"] = [item.model_dump() for item in payload.lab_results]
+    normalize_ocr_lab_payload(patient)
     attach_lab_observations(patient)
 
     trials = load_trials(str(TRIAL_JSON_PATH))
@@ -127,7 +131,14 @@ def match_trials(payload: MatchRequest):
         "match_mode": payload.match_mode,
         "data_quality": summarize_patient_data_quality(patient),
         "matches": matches,
+        "review_queue": build_review_queue(matches),
     }
+
+
+@app.post("/v1/review/queue")
+def review_queue(payload: MatchRequest):
+    match_payload = match_trials(payload)
+    return {"review_queue": match_payload.get("review_queue", [])}
 
 
 @app.post("/v1/feedback")

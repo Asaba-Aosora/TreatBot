@@ -7,6 +7,7 @@ import re
 from typing import Any, Dict, List
 
 from codes.lab_rules import extract_lab_rule_clauses
+from codes.rag_clause_assist import extract_rag_lab_clause_candidates
 
 
 def split_criteria_chunks(text: str, prefix: str) -> List[Dict[str, Any]]:
@@ -30,11 +31,39 @@ def enrich_parsed_conditions(trial: Dict[str, Any], base: Dict[str, Any]) -> Dic
     # 按条款切片分别抽取，避免跨句误匹配
     inc_clauses: List[Dict[str, Any]] = []
     for ch in inc_chunks:
-        inc_clauses.extend(extract_lab_rule_clauses(ch["text"], "inclusion"))
+        text = ch["text"]
+        inc_clauses.extend(extract_lab_rule_clauses(text, "inclusion"))
+        inc_clauses.extend(
+            extract_rag_lab_clause_candidates(text, "inclusion", chunk_id=ch["chunk_id"])
+        )
     exc_clauses: List[Dict[str, Any]] = []
     for ch in exc_chunks:
-        exc_clauses.extend(extract_lab_rule_clauses(ch["text"], "exclusion"))
-    base["inclusion_lab_clauses"] = inc_clauses
-    base["exclusion_lab_clauses"] = exc_clauses
-    base["parser_version"] = "trial_parse_v1"
+        text = ch["text"]
+        exc_clauses.extend(extract_lab_rule_clauses(text, "exclusion"))
+        exc_clauses.extend(
+            extract_rag_lab_clause_candidates(text, "exclusion", chunk_id=ch["chunk_id"])
+        )
+    base["inclusion_lab_clauses"] = _dedup_clauses(inc_clauses)
+    base["exclusion_lab_clauses"] = _dedup_clauses(exc_clauses)
+    base["parser_version"] = "trial_parse_v2"
     return base
+
+
+def _dedup_clauses(clauses: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    best: Dict[str, Dict[str, Any]] = {}
+    for clause in clauses:
+        metric_id = str(clause.get("metric_id") or "")
+        operator = str(clause.get("operator") or "")
+        threshold = clause.get("threshold")
+        field = str(clause.get("field") or "")
+        context = str(clause.get("context") or "")
+        key = f"{field}|{metric_id}|{operator}|{threshold}|{context}"
+        current = best.get(key)
+        if current is None:
+            best[key] = clause
+            continue
+        if float(clause.get("confidence", 0.0) or 0.0) > float(
+            current.get("confidence", 0.0) or 0.0
+        ):
+            best[key] = clause
+    return list(best.values())

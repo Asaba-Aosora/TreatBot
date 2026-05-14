@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from codes.lab_lexicon import METRIC_ALIASES as LEXICON_METRICS
 from codes.lab_normalize import attach_lab_observations
+from codes.lab_policy import HIGH_RISK_METRICS
 from codes.lab_rules import evaluate_lab_rule_clauses
 from codes.trial_parse import enrich_parsed_conditions
 
@@ -704,6 +705,27 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         lab_gate = (not exclusion_triggered) and (lab_pass or lab_fail_count <= 1)
         eligible = bool(disease_match and lab_gate)
 
+    review_items: List[Dict[str, Any]] = []
+    for check in checks:
+        status = check.get("status")
+        metric_id = str(check.get("metric_id") or "")
+        if status not in ("fail", "unknown"):
+            continue
+        is_high_risk = metric_id in HIGH_RISK_METRICS
+        priority = "p0" if (status == "fail" and is_high_risk) else ("p1" if is_high_risk else "p2")
+        review_items.append(
+            {
+                "metric_id": metric_id,
+                "status": status,
+                "priority": priority,
+                "is_high_risk": is_high_risk,
+                "field": check.get("field"),
+                "message": check.get("message", ""),
+                "evidence": check.get("evidence", ""),
+                "decision_reason_code": check.get("decision_reason_code", ""),
+            }
+        )
+
     return {
         'trial_id': trial.get('项目编码'),
         'trial_name': trial.get('项目名称') or trial.get('研究中心所在医院') or trial.get('研究中心所在城市'),
@@ -728,6 +750,7 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         'semantic_score': semantic_score,
         'score': base_score,
         'reasons': reasons,
+        'review_items': review_items,
         'trial': trial,
     }
 
@@ -788,3 +811,20 @@ def summarize_patient_data_quality(patient: Dict) -> Dict[str, Any]:
         "unknown_status_rows": unknown_status,
         "missing_core_fields": missing_core,
     }
+
+
+def build_review_queue(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    queue: List[Dict[str, Any]] = []
+    for item in matches or []:
+        for review in item.get("review_items") or []:
+            queue.append(
+                {
+                    "trial_id": item.get("trial_id"),
+                    "trial_name": item.get("trial_name"),
+                    "score": item.get("score"),
+                    **review,
+                }
+            )
+    prio_rank = {"p0": 0, "p1": 1, "p2": 2}
+    queue.sort(key=lambda x: (prio_rank.get(str(x.get("priority")), 9), -float(x.get("score") or 0.0)))
+    return queue

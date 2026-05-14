@@ -8,6 +8,7 @@ import re
 from typing import Any, Dict, List, Tuple
 
 from codes.lab_lexicon import METRIC_ALIASES
+from codes.lab_policy import CLAUSE_CONFIDENCE_GATE, UNIT_GUARD_METRICS
 
 
 def normalize_metric_key(name: str) -> str:
@@ -54,19 +55,49 @@ def extract_lab_rule_clauses(text: str, field: str) -> List[Dict[str, Any]]:
         val = float(m.group("val"))
         span = m.group(0)
         clauses.append(
-            {
-                "metric_id": metric_id,
-                "operator": op,
-                "threshold": val,
-                "relative_to_uln": (
+            build_clause(
+                metric_id=metric_id,
+                operator=op,
+                threshold=val,
+                relative_to_uln=(
                     "uln" in m.group(0).lower() or "正常上限" in m.group(0)
                 ),
-                "field": field,
-                "severity": "must",
-                "evidence": span.strip(),
-            }
+                field=field,
+                evidence=span.strip(),
+                source="regex",
+                confidence=0.98,
+                context=text.strip(),
+            )
         )
     return clauses
+
+
+def build_clause(
+    *,
+    metric_id: str,
+    operator: str,
+    threshold: float,
+    relative_to_uln: bool,
+    field: str,
+    evidence: str,
+    source: str,
+    confidence: float,
+    context: str = "",
+    chunk_id: str = "",
+) -> Dict[str, Any]:
+    return {
+        "metric_id": metric_id,
+        "operator": operator,
+        "threshold": float(threshold),
+        "relative_to_uln": bool(relative_to_uln),
+        "field": field,
+        "severity": "must",
+        "evidence": evidence,
+        "source": source,
+        "confidence": float(confidence),
+        "context": context,
+        "chunk_id": chunk_id,
+    }
 
 
 def _patient_metric_map(patient: Dict) -> Dict[str, float]:
@@ -126,7 +157,18 @@ def _suspect_unit_mismatch(
     if patient_val <= threshold * 8:
         return False
     # 对这些常见肝肾相关指标启用保护，避免误拒绝
-    return metric_id in {"cr", "tbil", "alt", "ast", "alb"}
+    return metric_id in UNIT_GUARD_METRICS
+
+
+def _extract_uln(raw_range: str) -> float | None:
+    text = str(raw_range or "").replace("~", "-").replace("～", "-")
+    m = re.search(r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)", text)
+    if not m:
+        return None
+    try:
+        return float(m.group(2))
+    except ValueError:
+        return None
 
 
 def _compare(op: str, patient_val: float, threshold: float) -> bool:
@@ -139,6 +181,36 @@ def _compare(op: str, patient_val: float, threshold: float) -> bool:
     if op in ("<=", "≤"):
         return patient_val <= threshold
     return False
+
+
+def _build_check(
+    *,
+    clause: Dict[str, Any],
+    status: str,
+    message: str = "",
+    patient_value: float | None = None,
+    threshold: float | None = None,
+    operator: str | None = None,
+    decision_reason_code: str = "",
+) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "metric_id": clause.get("metric_id"),
+        "field": clause.get("field"),
+        "status": status,
+        "message": message,
+        "evidence": clause.get("evidence"),
+        "source": clause.get("source", "regex"),
+        "confidence": float(clause.get("confidence", 1.0) or 1.0),
+        "context": clause.get("context", ""),
+        "decision_reason_code": decision_reason_code or status,
+    }
+    if patient_value is not None:
+        out["patient_value"] = patient_value
+    if threshold is not None:
+        out["threshold"] = threshold
+    if operator:
+        out["operator"] = operator
+    return out
 
 
 def evaluate_lab_rule_clauses(
@@ -165,27 +237,70 @@ def evaluate_lab_rule_clauses(
         op = clause["operator"]
         thr = float(clause["threshold"])
         pv = pmap.get(mid)
-        if clause.get("relative_to_uln"):
+        confidence = float(clause.get("confidence", 1.0) or 1.0)
+        if confidence < CLAUSE_CONFIDENCE_GATE:
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "inclusion",
-                    "status": "unknown",
-                    "message": "需实验室ULN才能判定相对阈值",
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="unknown",
+                    message="规则置信度不足，需人工核对",
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="low_confidence",
+                )
+            )
+            next_steps.append(mid)
+            continue
+        if clause.get("relative_to_uln"):
+            uln = _extract_uln((pmeta.get(mid) or {}).get("raw_range", ""))
+            if uln is not None and uln > 0 and pv is not None:
+                if _compare(op, pv, thr * uln):
+                    checks.append(
+                        _build_check(
+                            clause=clause,
+                            status="pass",
+                            patient_value=pv,
+                            threshold=thr * uln,
+                            operator=op,
+                            decision_reason_code="uln_ratio_computed",
+                        )
+                    )
+                else:
+                    inclusion_failed = True
+                    checks.append(
+                        _build_check(
+                            clause=clause,
+                            status="fail",
+                            message=f"不满足入组要求: {mid} 当前{pv}, 要求 {op}{thr}xULN",
+                            patient_value=pv,
+                            threshold=thr * uln,
+                            operator=op,
+                            decision_reason_code="uln_ratio_failed",
+                        )
+                    )
+                continue
+            checks.append(
+                _build_check(
+                    clause=clause,
+                    status="unknown",
+                    message="需实验室ULN才能判定相对阈值",
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="missing_uln",
+                )
             )
             next_steps.append(mid)
             continue
         if pv is None:
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "inclusion",
-                    "status": "unknown",
-                    "message": "患者数据缺少该指标",
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="unknown",
+                    message="患者数据缺少该指标",
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="missing_patient_metric",
+                )
             )
             next_steps.append(mid)
             continue
@@ -194,43 +309,40 @@ def evaluate_lab_rule_clauses(
         if not ok:
             if _suspect_unit_mismatch(mid, pv, thr, op, pmeta.get(mid, {})):
                 checks.append(
-                    {
-                        "metric_id": mid,
-                        "field": "inclusion",
-                        "status": "unknown",
-                        "message": "疑似单位不一致，转为待人工核对",
-                        "patient_value": pv,
-                        "threshold": thr,
-                        "operator": op,
-                        "evidence": clause.get("evidence"),
-                    }
+                    _build_check(
+                        clause=clause,
+                        status="unknown",
+                        message="疑似单位不一致，转为待人工核对",
+                        patient_value=pv,
+                        threshold=thr,
+                        operator=op,
+                        decision_reason_code="unit_mismatch_suspected",
+                    )
                 )
                 next_steps.append(mid)
                 continue
             inclusion_failed = True
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "inclusion",
-                    "status": "fail",
-                    "message": f"不满足入组要求: {mid} 当前{pv}, 要求 {op}{thr}",
-                    "patient_value": pv,
-                    "threshold": thr,
-                    "operator": op,
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="fail",
+                    message=f"不满足入组要求: {mid} 当前{pv}, 要求 {op}{thr}",
+                    patient_value=pv,
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="inclusion_threshold_failed",
+                )
             )
         else:
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "inclusion",
-                    "status": "pass",
-                    "patient_value": pv,
-                    "threshold": thr,
-                    "operator": op,
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="pass",
+                    patient_value=pv,
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="inclusion_threshold_passed",
+                )
             )
 
     for clause in exclusion_clauses:
@@ -240,40 +352,55 @@ def evaluate_lab_rule_clauses(
         pv = pmap.get(mid)
         if pv is None:
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "exclusion",
-                    "status": "unknown",
-                    "message": "无法判断是否触发排除（缺指标）",
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="unknown",
+                    message="无法判断是否触发排除（缺指标）",
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="missing_patient_metric",
+                )
             )
             continue
+        if clause.get("relative_to_uln"):
+            uln = _extract_uln((pmeta.get(mid) or {}).get("raw_range", ""))
+            if uln is None or uln <= 0:
+                checks.append(
+                    _build_check(
+                        clause=clause,
+                        status="unknown",
+                        message="排除条款需ULN，当前无法判定",
+                        patient_value=pv,
+                        threshold=thr,
+                        operator=op,
+                        decision_reason_code="missing_uln",
+                    )
+                )
+                continue
+            thr = thr * uln
         if _compare(op, pv, thr):
             exclusion_triggered = True
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "exclusion",
-                    "status": "fail",
-                    "message": f"命中排除: {mid}={pv} 满足排除条件 {op}{thr}",
-                    "patient_value": pv,
-                    "threshold": thr,
-                    "operator": op,
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="fail",
+                    message=f"命中排除: {mid}={pv} 满足排除条件 {op}{thr}",
+                    patient_value=pv,
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="exclusion_triggered",
+                )
             )
         else:
             checks.append(
-                {
-                    "metric_id": mid,
-                    "field": "exclusion",
-                    "status": "pass",
-                    "patient_value": pv,
-                    "threshold": thr,
-                    "operator": op,
-                    "evidence": clause.get("evidence"),
-                }
+                _build_check(
+                    clause=clause,
+                    status="pass",
+                    patient_value=pv,
+                    threshold=thr,
+                    operator=op,
+                    decision_reason_code="exclusion_not_triggered",
+                )
             )
 
     return (
