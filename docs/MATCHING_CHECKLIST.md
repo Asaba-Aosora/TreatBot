@@ -11,11 +11,11 @@
 
 | 字段 | 类型 | 硬性作用 | OCR/表单优先级 |
 | --- | --- | --- | --- |
-| `diagnosis` / `cancer_type` | 字符串 | **准入门槛**：须与试验 `疾病三级标签` 匹配，否则不进入候选 | P0 |
-| `age` | 整数 | 与试验入组年龄比较；试验有要求但缺失时 strict 模式不可 eligible | P0 |
+| `diagnosis` / `cancer_type` | 字符串 | **准入门槛**：须与试验 `疾病三级标签` 匹配 | P0 |
+| `age` | 整数 | 与试验入组年龄比较；**已知值**违反则硬拒 | P0 |
 | `gender` | 字符串 | 与试验性别要求比较（「不限」则跳过） | P0 |
-| `ecog` | 整数 | 与试验 ECOG 范围比较 | P0 |
-| `treatment_lines` | 整数 | 与试验最低治疗线数比较 | P0 |
+| `ecog` | 整数 | 与试验 ECOG 范围比较；**缺失时不硬拒**，标注「ECOG缺失」待医生补充 | P0 |
+| `treatment_lines` | 整数 | 与试验最低治疗线数比较；缺失时不硬拒 | P0 |
 | `location` | 字符串 | 不挡候选；影响地理距离加分与排序 | P1 |
 | `cancer_stage` | 字符串 | 不参与硬过滤；参与弱语义排序 | P1 |
 | `biomarkers` | 字符串列表 | 不参与硬过滤；参与弱语义排序 | P1 |
@@ -30,7 +30,7 @@
 试验进入候选列表须同时满足：
 
 1. **疾病匹配** `disease_match = true`  
-   - 患者 `diagnosis` 与试验 `疾病三级标签` 做子串/关键词交集（偏宽召回）。
+   - 患者 `cancer_type` + 规范化 `diagnosis` 与试验 `疾病三级标签` 匹配（同义词如 胃恶性肿瘤→胃癌；过滤 TNM 噪声；英文 token 至少 2 字符）。
 2. **eligible = true**（见 2.2，随 `match_mode` 不同）。
 
 ### 2.2 单试验硬规则（`match_trial`）
@@ -39,20 +39,22 @@
 
 | 规则 | 抽取来源 | 判定逻辑 | 患者缺失时 |
 | --- | --- | --- | --- |
-| 年龄 | 入组条件 | `age_min` ≤ age ≤ `age_max` | strict：试验有年龄要求且患者无 age → **不可 eligible** |
-| 性别 | 入组条件 | 男/女/不限 | strict：试验限定性别且患者无 gender → **不可 eligible** |
-| ECOG | 入组条件 | `ecog_min` ~ `ecog_max` | strict：试验有 ECOG 要求且患者无 ecog → **不可 eligible** |
-| 治疗线数 | 入组条件 | treatment_lines ≥ `treatment_lines_min` | strict：试验有线数要求且患者无 treatment_lines → **不可 eligible** |
+| 年龄 | 入组条件 | `age_min` ≤ age ≤ `age_max` | 缺失 → **待核对**；已知值违反 → 硬拒 |
+| 性别 | 入组条件 | 男/女/不限 | 缺失 → 待核对；已知值违反 → 硬拒 |
+| ECOG | 入组条件 | `ecog_min` ~ `ecog_max` | 缺失 → **ECOG缺失**，仍给候选；已知值违反 → 硬拒 |
+| 治疗线数 | 入组条件 | treatment_lines ≥ `treatment_lines_min` | 缺失 → 待核对；已知值违反 → 硬拒 |
 | 化验数值 | 入组/排除解析条款 | 见第三节 | 缺数据多为 **unknown**（不硬失败）；明确违反为 **fail** |
 
 **hard_rule_pass** = 年龄 ∧ 性别 ∧ ECOG ∧ 线数 ∧ 化验 ∧ 未触发排除化验。
 
 ### 2.3 匹配模式
 
-| 模式 | eligible 条件 |
-| --- | --- |
-| **strict**（默认） | 疾病匹配 ∧ hard_rule_pass ∧ 核心字段无缺失（年龄/性别/ECOG/线数，当试验有要求时） |
-| **balanced** | 疾病匹配 ∧ 未触发排除 ∧（化验全过 **或** 入组化验 fail ≤ 1 条） |
+| 模式 | 进入候选列表 | 可确认入选（`eligible`） |
+| --- | --- | --- |
+| **strict**（默认） | 疾病匹配 ∧ 无已知硬违反（含化验 fail、排除触发） | 上述 ∧ 核心字段齐全 ∧ 化验全过 |
+| **balanced** | 疾病匹配 ∧ 未触发排除 ∧（化验全过 **或** 入组化验 fail ≤ 1） | 上述 ∧ 核心字段齐全 |
+
+**核心字段缺失**（ECOG/线数等）：不剔除候选，写入 `missing_core_messages` / `needs_review`，降排序分，等医生补充后再可确认入选。
 
 ### 2.4 化验判定细则（`lab_rules.evaluate_lab_rule_clauses`）
 
@@ -153,6 +155,7 @@
 | 化验频率统计 | `scripts/summarize_trial_lab_metrics.py` |
 | 离线匹配 | `scripts/run_match.py` |
 | OCR 患者压测 | `scripts/benchmark_match_from_ocr_json.py` |
+| **患者 JSON 按清单整理** | `scripts/normalize_patient_for_matching.py` |
 | 回归 fixture | `structured_data/eval/fixture_patient.json` |
 
 ---
@@ -161,10 +164,10 @@
 
 **核心字段**
 
-- [ ] `diagnosis`
+- [ ] `diagnosis` / `cancer_type`（文件名可补 `cancer_type`，如 HAQI→胃癌）
 - [ ] `cancer_stage`（或已从 diagnosis 拆分）
-- [ ] `age` / `gender` / `ecog` / `treatment_lines`
-- [ ] `location`
+- [ ] `age` / `gender` / `ecog` / `treatment_lines`（文件名可补线数，如「一线」→1）
+- [ ] `location`（文件名 / OCR 籍贯 / 出生地）
 - [ ] `biomarkers`（KRAS、MSI、PD-L1 等，与基因报告一致）
 
 **化验 P0（9 项）**

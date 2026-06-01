@@ -72,6 +72,49 @@ def test_unit_mismatch_fallback_to_unknown():
     assert "cr" in next_steps
 
 
+def test_missing_ecog_still_lists_candidates_strict():
+    root = Path(__file__).resolve().parent.parent
+    trial_path = root / "original_data" / "clinical_trials" / "trials_structured.json"
+    if not trial_path.exists():
+        return
+    patient = {
+        "diagnosis": "胃癌",
+        "age": 70,
+        "gender": "男",
+        "ecog": None,
+        "treatment_lines": None,
+        "lab_observations": [],
+    }
+    trials = load_trials(str(trial_path))
+    matches = rank_trials(patient, trials, top_n=20, match_mode="strict")
+    assert len(matches) >= 1
+    assert all(not m.get("hard_excluded") for m in matches)
+    assert any(m.get("needs_review") for m in matches)
+    assert all(not m.get("eligible") for m in matches if m.get("missing_core_fields"))
+
+
+def test_known_ecog_fail_hard_excludes():
+    from codes.trial_matcher import match_trial, parse_trial_condition
+    from codes.trial_parse import enrich_parsed_conditions
+
+    patient = {"diagnosis": "胃癌", "age": 70, "gender": "男", "ecog": 3, "treatment_lines": 1}
+    trial = {
+        "项目编码": "MOCK",
+        "项目名称": "Mock",
+        "疾病三级标签": "胃癌",
+        "labels": ["胃癌"],
+        "入组条件": "ECOG评分0-2分",
+        "排除条件": "",
+        "研究中心所在省份": "",
+        "研究中心所在城市": "",
+    }
+    base = parse_trial_condition(trial)
+    trial["parsed_conditions"] = enrich_parsed_conditions(trial, base)
+    result = match_trial(patient, trial, match_mode="strict")
+    assert result["hard_excluded"] is True
+    assert result.get("ecog_pass") is False
+
+
 def test_fixed_patient_can_recall_candidates_balanced():
     root = Path(__file__).resolve().parent.parent
     patient_path = (

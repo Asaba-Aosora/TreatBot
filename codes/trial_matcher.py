@@ -1,16 +1,32 @@
 import json
 import re
-from math import asin, cos, radians, sin, sqrt
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from codes.geo_admin import (
+    compute_geo_distance,
+    find_nearest_trial_site,
+    geo_score,
+    parse_trial_site_pairs,
+    province_prefix_match,
+    resolve_coord,
+)
+from codes.patient_filename_infer import build_patient_disease_text, normalize_diagnosis_for_matching
 from codes.lab_lexicon import METRIC_ALIASES as LEXICON_METRICS
 from codes.lab_normalize import attach_lab_observations
 from codes.lab_policy import HIGH_RISK_METRICS
 from codes.lab_rules import evaluate_lab_rule_clauses
 from codes.trial_parse import enrich_parsed_conditions
 
-MATCHER_VERSION = "matcher_layers_v1"
+MATCHER_VERSION = "matcher_layers_v2"
+
+# 患者核心字段：缺失时不硬拒候选，仅标注待医生核对
+CORE_FIELD_META: Dict[str, Dict[str, str]] = {
+    "age": {"label": "年龄", "missing_msg": "年龄缺失"},
+    "gender": {"label": "性别", "missing_msg": "性别缺失"},
+    "ecog": {"label": "ECOG", "missing_msg": "ECOG缺失"},
+    "treatment_lines": {"label": "治疗线数", "missing_msg": "治疗线数缺失"},
+}
 
 
 def normalize_text(text: Optional[str]) -> str:
@@ -25,195 +41,14 @@ def split_labels(label_str: Optional[str]) -> List[str]:
     parts = re.split(r'[,，、；;]+', label_str)
     return [part.strip() for part in parts if part.strip()]
 
-LOCATION_COORDS = {
-    # 省会 / 直辖市
-    '北京': (39.9042, 116.4074),
-    '天津': (39.0842, 117.2000),
-    '上海': (31.2304, 121.4737),
-    '重庆': (29.4316, 106.9123),
-    '广州': (23.1291, 113.2644),
-    '深圳': (22.5431, 114.0579),
-    '杭州': (30.2741, 120.1551),
-    '南京': (32.0603, 118.7969),
-    '武汉': (30.5928, 114.3055),
-    '成都': (30.5728, 104.0668),
-    '西安': (34.3416, 108.9398),
-    '沈阳': (41.8057, 123.4328),
-    '长春': (43.8171, 125.3235),
-    '哈尔滨': (45.8038, 126.5349),
-    '济南': (36.6512, 117.1201),
-    '青岛': (36.0671, 120.3826),
-    '郑州': (34.7466, 113.6254),
-    '长沙': (28.2282, 112.9388),
-    '合肥': (31.8206, 117.2272),
-    '福州': (26.0745, 119.2965),
-    '南昌': (28.6820, 115.8579),
-    '南宁': (22.8170, 108.3669),
-    '昆明': (24.8801, 102.8329),
-    '贵阳': (26.6470, 106.6302),
-    '西宁': (36.6171, 101.7782),
-    '兰州': (36.0611, 103.8343),
-    '乌鲁木齐': (43.8256, 87.6168),
-    '呼和浩特': (40.8170, 111.7652),
-    '南通': (31.9802, 120.8943),
-    '无锡': (31.5704, 120.2886),
-    '常州': (31.8106, 119.9747),
-    '苏州': (31.2989, 120.5853),
-    '厦门': (24.4798, 118.0894),
-    '沈阳': (41.8057, 123.4328),
-    '大连': (38.9140, 121.6147),
-    '哈尔滨': (45.8038, 126.5349),
-    '郑州': (34.7466, 113.6254),
-    '济南': (36.6512, 117.1201),
-    '长沙': (28.2282, 112.9388),
-    '石家庄': (38.0428, 114.5143),
-    '太原': (37.8706, 112.5489),
-    '南昌': (28.6820, 115.8579),
-    '福州': (26.0745, 119.2965),
-    '合肥': (31.8206, 117.2272),
-    '海南省': (20.0174, 110.3492),
-    '河北省': (38.0428, 114.5143),
-    '河南省': (34.7655, 113.7536),
-    '湖南省': (28.1127, 112.9834),
-    '湖北省': (30.5454, 114.3423),
-    '山东省': (36.6758, 117.0009),
-    '山西省': (37.8570, 112.5492),
-    '陕西省': (34.3416, 108.9398),
-    '江西省': (28.6742, 115.9100),
-    '浙江省': (29.1832, 120.0934),
-    '江苏省': (32.0617, 118.7778),
-    '安徽省': (31.8612, 117.2857),
-    '广东省': (23.1317, 113.2665),
-    '广西壮族自治区': (23.8298, 108.7881),
-    '云南省': (25.0389, 102.7183),
-    '贵州省': (26.5982, 106.7074),
-    '四川省': (30.6595, 104.0657),
-    '重庆市': (29.4316, 106.9123),
-    '天津市': (39.0842, 117.2000),
-    '北京市': (39.9042, 116.4074),
-    '上海市': (31.2304, 121.4737),
-    '内蒙古自治区': (40.8170, 111.7652),
-    '宁夏回族自治区': (38.4884, 106.2385),
-    '新疆维吾尔自治区': (43.7928, 87.6177),
-    '西藏自治区': (29.6520, 91.1721),
-    '海南省': (20.0174, 110.3492),
-    '青海省': (36.6203, 101.7782),
-    '贵州省': (26.5982, 106.7074),
-    '甘肃省': (36.0611, 103.8343),
-    '辽宁省': (41.2959, 123.1238),
-    '吉林省': (43.8965, 125.3268),
-    '黑龙江省': (45.7420, 126.6625),
-}
-
-
-def normalize_location_name(name: str) -> str:
-    norm = normalize_text(name)
-    if not norm:
-        return ''
-    return re.sub(r'(省|市|自治区|特别行政区|地区|盟|州)$', '', norm)
-
-
 def find_location_coord(location: str) -> Optional[Tuple[float, float]]:
-    if not location:
-        return None
-    norm = normalize_text(location)
-    if not norm:
-        return None
-
-    candidates = []
-    for name, coord in LOCATION_COORDS.items():
-        raw_norm = normalize_text(name)
-        stripped = normalize_location_name(name)
-        candidates.append((raw_norm, coord))
-        if stripped and stripped != raw_norm:
-            candidates.append((stripped, coord))
-
-    candidates.sort(key=lambda x: len(x[0]), reverse=True)
-    for name_norm, coord in candidates:
-        if name_norm and name_norm in norm:
-            return coord
-    return None
-
-
-def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    r = 6371.0
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
-    c = 2 * asin(min(1, sqrt(a)))
-    return r * c
-
-
-def compute_geo_distance(patient_location: str, province: str, city: str) -> Optional[float]:
-    """计算患者位置与试验地点的最短距离（支持多地点试验）"""
-    patient_coord = find_location_coord(patient_location)
-    if not patient_coord:
-        return None
-    
-    distances = []
-    
-    # 如果city包含多个地点（用逗号/中文逗号分隔），计算到每个地点的距离
-    if city:
-        cities = re.split(r'[,，]', city)
-        for c in cities:
-            c = c.strip()
-            if c:
-                trial_coord = find_location_coord(c)
-                if trial_coord:
-                    dist = haversine(patient_coord[0], patient_coord[1], trial_coord[0], trial_coord[1])
-                    distances.append(dist)
-    
-    # 如果没有找到city的坐标，尝试用province
-    if not distances and province:
-        provinces = re.split(r'[,，]', province)
-        for p in provinces:
-            p = p.strip()
-            if p:
-                trial_coord = find_location_coord(p)
-                if trial_coord:
-                    dist = haversine(patient_coord[0], patient_coord[1], trial_coord[0], trial_coord[1])
-                    distances.append(dist)
-    
-    # 返回最短距离
-    return min(distances) if distances else None
+    """兼容旧接口：解析地名并返回 (lat, lng)。"""
+    return resolve_coord(location)
 
 
 def find_nearest_location(patient_location: str, province: str, city: str) -> Optional[Dict]:
-    """找出试验中距患者最近的具体地点及距离，用于高亮"""
-    patient_coord = find_location_coord(patient_location)
-    if not patient_coord:
-        return None
-    
-    nearest = None
-    min_dist = float('inf')
-    
-    # 检查city中的每个地点
-    if city:
-        cities = re.split(r'[,，]', city)
-        for c in cities:
-            c = c.strip()
-            if c:
-                trial_coord = find_location_coord(c)
-                if trial_coord:
-                    dist = haversine(patient_coord[0], patient_coord[1], trial_coord[0], trial_coord[1])
-                    if dist < min_dist:
-                        min_dist = dist
-                        nearest = {'location': c, 'distance': dist, 'type': 'city'}
-    
-    # 如果city中没找到，检查province
-    if (not nearest or min_dist == float('inf')) and province:
-        provinces = re.split(r'[,，]', province)
-        for p in provinces:
-            p = p.strip()
-            if p:
-                trial_coord = find_location_coord(p)
-                if trial_coord:
-                    dist = haversine(patient_coord[0], patient_coord[1], trial_coord[0], trial_coord[1])
-                    if dist < min_dist:
-                        min_dist = dist
-                        nearest = {'location': p, 'distance': dist, 'type': 'province'}
-    
-    return nearest if nearest and min_dist < float('inf') else None
+    """找出试验中距患者最近的具体地点及距离，用于高亮。"""
+    return find_nearest_trial_site(patient_location, province, city)
 
 
 def extract_age(text: str) -> Tuple[Optional[int], Optional[int]]:
@@ -429,53 +264,42 @@ def semantic_similarity(query: str, text: str) -> float:
 
 
 def simple_label_match(patient_diag: str, trial_labels: List[str]) -> bool:
-    patient_norm = normalize_text(patient_diag)
-    if not patient_norm:
-        return False
-    for label in trial_labels:
-        label_norm = normalize_text(label)
-        if not label_norm:
-            continue
-        if label_norm in patient_norm or patient_norm in label_norm:
-            return True
-        # use keyword intersection for phrases
-        label_words = re.split(r'[\(\)\s/-]', label_norm)
-        if any(word and word in patient_norm for word in label_words):
-            return True
-    return False
+    return bool(find_matching_labels(patient_diag, trial_labels))
 
 
 def find_matching_labels(patient_diag: str, trial_labels: List[str]) -> List[str]:
-    matched = []
-    patient_norm = normalize_text(patient_diag)
+    matched: List[str] = []
+    patient_norm = normalize_diagnosis_for_matching(patient_diag)
     if not patient_norm:
         return matched
     for label in trial_labels:
         label_norm = normalize_text(label)
         if not label_norm:
             continue
+        label_canon = normalize_diagnosis_for_matching(label)
+        if label_canon and (label_canon in patient_norm or patient_norm in label_canon):
+            matched.append(label)
+            continue
         if label_norm in patient_norm or patient_norm in label_norm:
             matched.append(label)
             continue
-        label_words = re.split(r'[\(\)\s/-]', label_norm)
-        if any(word and word in patient_norm for word in label_words):
+        label_words = re.split(r"[\(\)\s/-]", label_norm)
+        if any(
+            _label_token_valid(word) and word in patient_norm
+            for word in label_words
+        ):
             matched.append(label)
     return matched
 
 
-def geo_score(patient_location: str, province: str, city: str) -> Tuple[int, Optional[float]]:
-    distance = compute_geo_distance(patient_location, province, city)
-    if distance is None:
-        patient_norm = normalize_text(patient_location)
-        province_norm = normalize_text(province)
-        if province_norm and province_norm in patient_norm:
-            return 1, None
-        return 2, None
-    if distance < 50:
-        return 0, distance
-    if distance < 200:
-        return 1, distance
-    return 2, distance
+def _label_token_valid(token: str) -> bool:
+    if not token:
+        return False
+    if re.fullmatch(r"[a-zA-Z]+", token):
+        return len(token) >= 2
+    if re.fullmatch(r"\d+", token):
+        return False
+    return len(token) >= 1
 
 
 def parse_trial_condition(trial: Dict) -> Dict:
@@ -515,7 +339,7 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
     if patient.get("lab_results") and not patient.get("lab_observations"):
         attach_lab_observations(patient)
 
-    patient_diag = patient.get('diagnosis') or patient.get('cancer_type') or ''
+    patient_diag = build_patient_disease_text(patient)
     labels = trial.get('labels', [])
     matching_labels = find_matching_labels(patient_diag, labels)
     disease_match = bool(matching_labels)
@@ -622,15 +446,16 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         base_score += 2
 
     patient_norm = normalize_text(location)
-    city_norm = normalize_text(city)
-    province_norm = normalize_text(province)
-    location_match = False
-    if geo_rank in (0, 1):
-        location_match = True
-    elif patient_norm and (city_norm and city_norm in patient_norm or province_norm and province_norm in patient_norm):
-        location_match = True
+    location_match = geo_rank in (0, 1)
+    if not location_match and location:
+        for prov, cit in parse_trial_site_pairs(province, city):
+            if cit and normalize_text(cit) in patient_norm:
+                location_match = True
+                break
+            if prov and province_prefix_match(location, prov):
+                location_match = True
+                break
 
-    # 找出最近的地点（用于HTML高亮）
     nearest_location = find_nearest_location(location, province, city)
 
     patient_semantic_text = " ".join(
@@ -672,14 +497,22 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         condition.get("treatment_lines_min") is not None and treatment_lines is None
     )
 
+    missing_core_fields: List[str] = []
     if age_required_but_missing:
-        next_steps.append("补充年龄")
+        missing_core_fields.append("age")
     if gender_required_but_missing:
-        next_steps.append("补充性别")
+        missing_core_fields.append("gender")
     if ecog_required_but_missing:
-        next_steps.append("补充ECOG评分")
+        missing_core_fields.append("ecog")
     if lines_required_but_missing:
-        next_steps.append("补充治疗线数")
+        missing_core_fields.append("treatment_lines")
+
+    for field in missing_core_fields:
+        msg = CORE_FIELD_META.get(field, {}).get("missing_msg") or f"{field}缺失"
+        next_steps.append(msg)
+
+    missing_core_penalty = len(missing_core_fields) * 3.0
+    base_score -= missing_core_penalty
 
     hard_rule_pass = (
         age_pass
@@ -691,21 +524,47 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
     )
 
     if mode == "strict":
-        required_core_complete = not any(
-            [
-                age_required_but_missing,
-                gender_required_but_missing,
-                ecog_required_but_missing,
-                lines_required_but_missing,
-            ]
-        )
-        eligible = bool(disease_match and hard_rule_pass and required_core_complete)
+        lab_gate = lab_pass and not exclusion_triggered
     else:
-        # 平衡模式：保留高召回，允许最多 1 条入组化验失败，便于后续人工复核。
+        # 平衡模式：允许最多 1 条入组化验 fail，便于后续人工复核。
         lab_gate = (not exclusion_triggered) and (lab_pass or lab_fail_count <= 1)
-        eligible = bool(disease_match and lab_gate)
+
+    # 已知数值违反或排除/化验硬失败 → 不进入候选列表
+    hard_excluded = bool(
+        exclusion_triggered
+        or (age is not None and not age_pass)
+        or (gender and not gender_pass)
+        or (ecog is not None and not ecog_pass)
+        or (treatment_lines is not None and not treatment_lines_pass)
+        or not lab_gate
+    )
+
+    # 可确认入选：已知规则全过且无待补核心字段（供医生核对后使用）
+    eligible = bool(
+        disease_match
+        and hard_rule_pass
+        and lab_gate
+        and not missing_core_fields
+    )
+    needs_review = bool(missing_core_fields) or any(
+        c.get("status") == "unknown" for c in checks
+    )
 
     review_items: List[Dict[str, Any]] = []
+    for field in missing_core_fields:
+        msg = CORE_FIELD_META.get(field, {}).get("missing_msg") or f"{field}缺失"
+        review_items.append(
+            {
+                "metric_id": field,
+                "status": "unknown",
+                "priority": "p0",
+                "is_high_risk": False,
+                "field": "patient",
+                "message": msg,
+                "evidence": "",
+                "decision_reason_code": "core_field_missing",
+            }
+        )
     for check in checks:
         status = check.get("status")
         metric_id = str(check.get("metric_id") or "")
@@ -738,6 +597,13 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         'treatment_lines_pass': treatment_lines_pass,
         'lab_pass': lab_pass,
         'eligible': eligible,
+        'hard_excluded': hard_excluded,
+        'needs_review': needs_review,
+        'missing_core_fields': missing_core_fields,
+        'missing_core_messages': [
+            CORE_FIELD_META.get(f, {}).get("missing_msg") or f"{f}缺失"
+            for f in missing_core_fields
+        ],
         'exclusion_triggered': exclusion_triggered,
         'inclusion_lab_failed': inclusion_lab_failed,
         'checks': checks,
@@ -761,7 +627,7 @@ def rank_trials(
     matched = []
     for trial in trials:
         result = match_trial(patient, trial, match_mode=match_mode)
-        if result['disease_match'] and result.get('eligible', True):
+        if result["disease_match"] and not result.get("hard_excluded", False):
             matched.append(result)
 
     matched.sort(key=lambda x: (-x['score'], x['geo_rank'], x.get('geo_distance', 99999)))
@@ -803,6 +669,15 @@ def summarize_patient_data_quality(patient: Dict) -> Dict[str, Any]:
         for field in ("diagnosis", "age", "gender", "ecog", "treatment_lines", "location")
         if not patient.get(field)
     ]
+    missing_core_labels = [
+        CORE_FIELD_META[f]["missing_msg"]
+        for f in missing_core
+        if f in CORE_FIELD_META
+    ]
+    if "diagnosis" in missing_core:
+        missing_core_labels.insert(0, "诊断缺失")
+    if "location" in missing_core:
+        missing_core_labels.append("地理位置缺失")
     return {
         "lab_rows_total": len(labs),
         "lab_observations_total": len(observations),
@@ -810,6 +685,7 @@ def summarize_patient_data_quality(patient: Dict) -> Dict[str, Any]:
         "meta_rows_total": len(meta_rows),
         "unknown_status_rows": unknown_status,
         "missing_core_fields": missing_core,
+        "missing_core_labels": missing_core_labels,
     }
 
 
@@ -902,8 +778,7 @@ def rank_trials_with_vector(
         fused_score = rule_score * rule_weight + vector_score * vector_weight
         result['fused_score'] = fused_score
         
-        # 只保留疾病匹配的结果
-        if result['disease_match'] and result.get('eligible', True):
+        if result["disease_match"] and not result.get("hard_excluded", False):
             matched.append(result)
     
     # 4. 按融合分数排序

@@ -44,7 +44,11 @@ def render_html(
         for key, label in quality_rows
     )
     missing_core = dq.get("missing_core_fields") or []
-    missing_core_text = "、".join(str(x) for x in missing_core) if missing_core else "无"
+    missing_labels = dq.get("missing_core_labels") or []
+    if missing_labels:
+        missing_core_text = "、".join(str(x) for x in missing_labels)
+    else:
+        missing_core_text = "、".join(str(x) for x in missing_core) if missing_core else "无"
 
     match_items = []
     for idx, item in enumerate(matches, start=1):
@@ -144,6 +148,24 @@ def render_html(
         ) or '-'
         location_match_text = '<span class="matched">匹配</span>' if item.get('location_match') else '<span class="dim">未匹配</span>'
         geo_distance_text = f"{item.get('geo_distance'):.1f}" if isinstance(item.get('geo_distance'), (int, float)) else '-'
+        review_note = ""
+        if item.get("needs_review"):
+            trial_missing = item.get("missing_core_messages") or []
+            if trial_missing:
+                review_note = "待核对：" + "、".join(html.escape(str(m)) for m in trial_missing)
+            else:
+                review_note = "待核对：部分化验/条款需补充"
+        eligible_text = (
+            "✔ 可确认入选"
+            if item.get("eligible")
+            else ("⚠ 建议候选（待医生核对）" if item.get("needs_review") else "✖ 未入选")
+        )
+
+        def rule_icon(field: str, passed: bool) -> str:
+            if field in (dq.get("missing_core_fields") or []):
+                return "？"
+            return "✔" if passed else "✖"
+
         match_items.append(f"""
         <div class="card">
           <button class="toggle-btn" onclick="toggleDetail('detail-{idx}')">
@@ -162,9 +184,10 @@ def render_html(
             </div>
             <div class="detail-block">
               <h3>匹配结果</h3>
-              <p><strong>是否入选:</strong> {'✔ 入选' if item.get('eligible') else '✖ 未入选'}</p>
+              <p><strong>推荐状态:</strong> {eligible_text}</p>
+              {f'<p><strong>核对提示:</strong> {review_note}</p>' if review_note else ''}
               <p><strong>疾病匹配:</strong> {'✔' if item.get('disease_match') else '✖'}</p>
-              <p><strong>硬规则通过:</strong> 年龄 {'✔' if item.get('age_pass') else '✖'} / 性别 {'✔' if item.get('gender_pass') else '✖'} / ECOG {'✔' if item.get('ecog_pass') else '✖'} / 治疗线数 {'✔' if item.get('treatment_lines_pass') else '✖'} / 化验 {'✔' if item.get('lab_pass') else '✖'}</p>
+              <p><strong>硬规则通过:</strong> 年龄 {rule_icon('age', item.get('age_pass'))} / 性别 {rule_icon('gender', item.get('gender_pass'))} / ECOG {rule_icon('ecog', item.get('ecog_pass'))} / 治疗线数 {rule_icon('treatment_lines', item.get('treatment_lines_pass'))} / 化验 {'✔' if item.get('lab_pass') else '✖'}</p>
               <p><strong>地理得分:</strong> {item.get('geo_rank')} | <strong>距离:</strong> {geo_distance_text} km</p>
               <p><strong>匹配理由 / 问题:</strong> {reasons_html}</p>
               <p><strong>建议补充:</strong> {next_steps_html}</p>

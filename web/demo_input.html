@@ -128,10 +128,10 @@
         <div class="field-group full">
           <label for="matchMode">匹配模式</label>
           <select id="matchMode" name="match_mode">
-            <option value="strict" selected>严格（推荐，精确率优先）</option>
-            <option value="balanced">平衡（召回优先）</option>
+            <option value="strict" selected>严格（已知违反硬拒，缺失字段待核对）</option>
+            <option value="balanced">平衡（化验容忍 1 条 fail）</option>
           </select>
-          <div class="hint">严格模式会要求关键硬条件（年龄/性别/ECOG/治疗线数）满足后才入选。</div>
+          <div class="hint">核心字段（ECOG/线数等）缺失时仍会给出候选，并标注「待医生核对」；仅明确违反入排时才剔除。</div>
         </div>
 
         <div class="field-group full">
