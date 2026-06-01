@@ -6,12 +6,38 @@ RAG/模板辅助条款抽取：
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
 from typing import Any, Dict, List
 
 from codes.lab_lexicon import METRIC_ALIASES
 from codes.lab_rules import build_clause, normalize_metric_key
-from codes.rag_index import _cosine, _hash_embed
+
+_HASH_DIM = 256
+
+
+def _hash_embed(text: str, dim: int = _HASH_DIM) -> List[float]:
+    """轻量哈希向量（仅用于化验模板相似度，与 Faiss 主索引无关）。"""
+    vec = [0.0] * dim
+    norm_text = normalize_text(text)
+    if not norm_text:
+        return vec
+    tokens = re.findall(r"[\w\u4e00-\u9fff]+", norm_text)
+    for tok in tokens:
+        digest = hashlib.md5(tok.encode("utf-8")).hexdigest()
+        idx = int(digest, 16) % dim
+        vec[idx] += 1.0
+    length = math.sqrt(sum(v * v for v in vec))
+    if length:
+        vec = [v / length for v in vec]
+    return vec
+
+
+def _cosine(a: List[float], b: List[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b))
 
 
 def normalize_text(text: str) -> str:

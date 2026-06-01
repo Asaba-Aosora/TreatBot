@@ -23,6 +23,10 @@ pydantic>=2.7.0
 # Utilities
 python-dotenv>=0.19.0
 
+# Vector Search & Embeddings (for semantic matching)
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.0  # 或改为 faiss-gpu if you have CUDA
+
 # Cloud OCR APIs
 # 豆包 (Doubao) - 推荐用于医学检验报告
 # 官网: https://www.volcengine.com/product/doubao

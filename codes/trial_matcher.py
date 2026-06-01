@@ -828,3 +828,87 @@ def build_review_queue(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     prio_rank = {"p0": 0, "p1": 1, "p2": 2}
     queue.sort(key=lambda x: (prio_rank.get(str(x.get("priority")), 9), -float(x.get("score") or 0.0)))
     return queue
+
+
+def rank_trials_with_vector(
+    patient: Dict,
+    trials: List[Dict],
+    vector_searcher,
+    top_n: int = 20,
+    match_mode: str = "strict",
+    rule_weight: float = 0.7,
+    vector_weight: float = 0.3,
+) -> List[Dict]:
+    """
+    融合规则匹配和向量语义匹配进行试验排序
+    
+    Args:
+        patient: 患者信息
+        trials: 试验列表
+        vector_searcher: VectorSearcher 实例（加载好的 Faiss 索引）
+        top_n: 返回前 n 个结果
+        match_mode: "strict" 或 "balanced"
+        rule_weight: 规则分数权重（默认 0.7）
+        vector_weight: 向量分数权重（默认 0.3）
+    
+    Returns:
+        按融合分数排序的试验列表，包含规则分数和向量分数
+    """
+    
+    # 1. 向量检索：获取语义相似的候选试验
+    patient_text = " ".join(
+        str(v)
+        for v in [
+            patient.get("diagnosis", ""),
+            patient.get("cancer_stage", ""),
+            " ".join(patient.get("biomarkers", []) or []),
+        ]
+    )
+    
+    if not patient_text.strip():
+        # 如果没有足够的患者信息，回退到纯规则匹配
+        return rank_trials(patient, trials, top_n, match_mode)
+    
+    # 获取向量检索结果
+    vector_results = vector_searcher.search(patient_text, top_k=min(40, len(trials)))
+    vector_trial_ids = {item['trial_id']: item['vector_score'] for item in vector_results}
+    
+    # 2. 确定要评估的候选试验（向量检索 top_k 或所有试验）
+    candidates_to_evaluate = []
+    
+    # 优先评估向量检索的 top_k 候选
+    for trial in trials:
+        trial_id = trial.get('项目编码')
+        if trial_id in vector_trial_ids:
+            candidates_to_evaluate.append(trial)
+    
+    # 如果向量检索结果不足，补充其他试验（最多到原来的两倍）
+    if len(candidates_to_evaluate) < min(80, len(trials)):
+        other_trials = [t for t in trials if t.get('项目编码') not in vector_trial_ids]
+        candidates_to_evaluate.extend(other_trials[:min(80 - len(candidates_to_evaluate), len(other_trials))])
+    
+    # 3. 对候选试验进行规则匹配
+    matched = []
+    for trial in candidates_to_evaluate:
+        result = match_trial(patient, trial, match_mode=match_mode)
+        
+        # 添加向量分数
+        trial_id = trial.get('项目编码')
+        vector_score = vector_trial_ids.get(trial_id, 0.0)
+        result['vector_score'] = vector_score
+        
+        # 计算融合分数
+        rule_score = result['score'] / 100.0  # 归一化规则分数
+        fused_score = rule_score * rule_weight + vector_score * vector_weight
+        result['fused_score'] = fused_score
+        
+        # 只保留疾病匹配的结果
+        if result['disease_match'] and result.get('eligible', True):
+            matched.append(result)
+    
+    # 4. 按融合分数排序
+    matched.sort(
+        key=lambda x: (-x['fused_score'], -x['vector_score'], x['geo_rank'], x.get('geo_distance', 99999))
+    )
+    
+    return matched[:top_n]
