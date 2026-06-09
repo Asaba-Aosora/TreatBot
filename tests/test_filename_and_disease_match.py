@@ -2,6 +2,7 @@ from codes.patient_filename_infer import (
     infer_from_filename,
     normalize_diagnosis_for_matching,
 )
+from codes.patient_matching_normalize import infer_cancer_stage, infer_stage_from_text
 from codes.trial_matcher import find_matching_labels, load_trials, rank_trials
 
 
@@ -15,6 +16,39 @@ def test_infer_chqi_filename():
     hints = infer_from_filename("CHQI胰腺癌辽宁沈阳.pdf")
     assert hints.cancer_type == "胰腺癌"
     assert hints.location_display and "沈阳" in hints.location_display
+
+
+def test_infer_stage_from_haqi_diagnosis():
+    diag = "胃恶性肿瘤 TXNXM1（Ⅳ）（KPS 80分）NRS0"
+    assert infer_stage_from_text(diag) == "IV"
+    assert infer_cancer_stage({"diagnosis": diag}) == "IV"
+
+
+def test_infer_stage_explicit_period():
+    assert infer_stage_from_text("胃癌 IV期") == "IV"
+    assert infer_stage_from_text("胰腺癌 3期") == "III"
+
+
+def test_infer_stage_paren_roman():
+    assert infer_stage_from_text("腺癌 (III)") == "III"
+    assert infer_stage_from_text("腺癌（2）") == "II"
+
+
+def test_infer_stage_tnm_m1():
+    assert infer_stage_from_text("cT2N1M1") == "IV"
+    assert infer_stage_from_text("胃窦腺癌 pM1") == "IV"
+
+
+def test_infer_stage_tnm_m0_not_iv():
+    assert infer_stage_from_text("cT2N0M0") is None
+
+
+def test_infer_stage_kps_paren_not_stage():
+    assert infer_stage_from_text("（KPS 80分）") is None
+
+
+def test_infer_stage_preserves_existing():
+    assert infer_cancer_stage({"cancer_stage": "III期", "diagnosis": ""}) == "III"
 
 
 def test_normalize_stomach_cancer_synonym():

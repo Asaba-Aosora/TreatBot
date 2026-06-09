@@ -31,6 +31,47 @@
     .mode-switch button { width: auto; padding: 8px 14px; border-radius: 999px; }
     .mode-switch button.active { background: #4f86ff; color: #fff; }
     .hidden { display: none; }
+    .combobox { position: relative; }
+    .combobox-control { display: flex; align-items: stretch; gap: 0; }
+    .combobox-control input { flex: 1; border-top-right-radius: 0; border-bottom-right-radius: 0; }
+    .combobox-toggle {
+      width: 42px;
+      flex: 0 0 42px;
+      border: 1px solid #d8dbe5;
+      border-left: none;
+      border-radius: 0 10px 10px 0;
+      background: #f7f9fc;
+      color: #4a5d86;
+      padding: 0;
+      font-size: 12px;
+      line-height: 1;
+    }
+    .combobox-toggle:hover { background: #eef2ff; }
+    .combobox-menu {
+      position: absolute;
+      z-index: 20;
+      left: 0;
+      right: 0;
+      top: calc(100% + 4px);
+      max-height: 220px;
+      overflow-y: auto;
+      margin: 0;
+      padding: 6px 0;
+      list-style: none;
+      background: #fff;
+      border: 1px solid #d8dbe5;
+      border-radius: 10px;
+      box-shadow: 0 10px 24px rgba(0, 0, 0, 0.08);
+    }
+    .combobox-menu li {
+      padding: 9px 12px;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    .combobox-menu li:hover,
+    .combobox-menu li.active { background: #eef2ff; color: #2d4cc5; }
+    .combobox-menu li.muted { color: #888; font-size: 13px; cursor: default; }
+    .combobox-menu li.muted:hover { background: transparent; color: #888; }
   </style>
 </head>
 <body>
@@ -117,12 +158,24 @@
         <div class="field-group full">
           <label>地理位置（优选省+市）</label>
           <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 12px;">
-            <select id="province" name="province"></select>
-            <input list="citySuggestions" id="city" name="city" placeholder="请选择或输入城市" />
+            <div class="combobox" id="provinceCombobox">
+              <div class="combobox-control">
+                <input id="province" name="province" type="text" autocomplete="off" placeholder="请选择或输入省份" />
+                <button type="button" class="combobox-toggle" aria-label="展开省份列表">▼</button>
+              </div>
+              <ul class="combobox-menu hidden" id="provinceMenu" role="listbox"></ul>
+            </div>
+            <div class="combobox" id="cityCombobox">
+              <div class="combobox-control">
+                <input id="city" name="city" type="text" autocomplete="off" placeholder="请选择或输入城市" />
+                <button type="button" class="combobox-toggle" aria-label="展开城市列表">▼</button>
+              </div>
+              <ul class="combobox-menu hidden" id="cityMenu" role="listbox"></ul>
+            </div>
           </div>
-          <datalist id="citySuggestions"></datalist>
+          <div class="hint">可从下拉选择，也可手动输入；输入时会按相关性推荐最接近的省市。未选省时，城市会显示「城市（省份）」便于定位。</div>
           <button type="button" class="secondary" onclick="confirmLocation()" style="margin-top:12px; width:auto;">确认省市</button>
-          <div id="locationStatus" class="confirm-box status">请选择省份并输入城市，再点击“确认省市”。</div>
+          <div id="locationStatus" class="confirm-box status">请选择或输入省份和城市，再点击“确认省市”。</div>
         </div>
 
         <div class="field-group full">
@@ -157,7 +210,7 @@
       <div class="metadata">
         <p>提示：</p>
         <ul>
-          <li>地点采用省+市组合可减少输入错误。</li>
+          <li>地点支持省市下拉选择或手动输入，系统会按关键词推荐最相关的选项。</li>
           <li>疾病标签提供了已有试验中的常见写法，若不完全匹配可输入近似名称。</li>
           <li>生成后的 JSON 可直接复制到 `run_match.py` 中的 `build_patient_input(...)` 参数。</li>
         </ul>
@@ -181,6 +234,21 @@
       "阑尾癌","阑尾癌（实体瘤）","非鳞状非小细胞肺癌","非鳞状非小细胞肺癌（实体瘤）","食管癌",
       "食管癌（实体瘤）","骨髓纤维化","鳞状非小细胞肺癌","鳞状非小细胞肺癌（实体瘤）","鼻咽癌"
     ];
+
+    const SOLID_TUMOR_SUFFIX = '（实体瘤）';
+
+    function dedupeLabelSuggestions(labels) {
+      const baseSet = new Set(
+        labels.filter(label => !label.endsWith(SOLID_TUMOR_SUFFIX))
+      );
+      return labels.filter(label => {
+        if (!label.endsWith(SOLID_TUMOR_SUFFIX)) {
+          return true;
+        }
+        const base = label.slice(0, -SOLID_TUMOR_SUFFIX.length);
+        return !baseSet.has(base);
+      });
+    }
 
     const provinceCityMap = {
       "北京市": ["北京市"],
@@ -218,10 +286,169 @@
       "澳门特别行政区": ["澳门半岛", "氹仔", "路环"]
     };
 
-    const provinceSelect = document.getElementById('province');
-    const cityDataList = document.getElementById('citySuggestions');
+    const provinceInput = document.getElementById('province');
+    const cityInput = document.getElementById('city');
+    const provinceMenu = document.getElementById('provinceMenu');
+    const cityMenu = document.getElementById('cityMenu');
     const labelDataList = document.getElementById('labelSuggestions');
+    const provinceList = Object.keys(provinceCityMap);
     let currentMode = 'manual';
+
+    function normalizeQuery(text) {
+      return String(text || '').trim().toLowerCase();
+    }
+
+    function relevanceScore(query, text) {
+      const q = normalizeQuery(query);
+      const t = normalizeQuery(text);
+      if (!q) {
+        return 0;
+      }
+      if (t === q) {
+        return 0;
+      }
+      if (t.startsWith(q)) {
+        return 1;
+      }
+      if (t.includes(q)) {
+        return 2;
+      }
+      const compact = t.replace(/[省市区县]/g, '');
+      const compactQ = q.replace(/[省市区县]/g, '');
+      if (compact.startsWith(compactQ) || compactQ.startsWith(compact)) {
+        return 3;
+      }
+      return 99;
+    }
+
+    function rankByRelevance(query, items, getLabel, limit) {
+      const maxItems = limit || 20;
+      const q = normalizeQuery(query);
+      const ranked = items
+        .map(item => ({
+          item,
+          score: relevanceScore(q, getLabel(item)),
+        }))
+        .filter(entry => !q || entry.score < 99)
+        .sort((a, b) => {
+          if (a.score !== b.score) {
+            return a.score - b.score;
+          }
+          return getLabel(a.item).localeCompare(getLabel(b.item), 'zh-CN');
+        })
+        .slice(0, maxItems)
+        .map(entry => entry.item);
+      if (ranked.length > 0 || q) {
+        return ranked;
+      }
+      return items.slice(0, maxItems);
+    }
+
+    function resolveProvince(value) {
+      const trimmed = String(value || '').trim();
+      if (!trimmed) {
+        return '';
+      }
+      if (provinceCityMap[trimmed]) {
+        return trimmed;
+      }
+      const ranked = rankByRelevance(trimmed, provinceList, item => item, 1);
+      return ranked[0] || trimmed;
+    }
+
+    function getProvinceOptions(query) {
+      return rankByRelevance(query, provinceList, item => item, 20).map(province => ({
+        label: province,
+        value: province,
+      }));
+    }
+
+    function getCityEntries(query) {
+      const province = resolveProvince(provinceInput.value);
+      if (provinceCityMap[province]) {
+        return rankByRelevance(query, provinceCityMap[province], city => city, 20).map(city => ({
+          city,
+          province,
+          label: city,
+        }));
+      }
+      const allEntries = [];
+      provinceList.forEach(prov => {
+        (provinceCityMap[prov] || []).forEach(city => {
+          allEntries.push({
+            city,
+            province: prov,
+            label: `${city}（${prov}）`,
+          });
+        });
+      });
+      return rankByRelevance(query, allEntries, entry => `${entry.city}${entry.province}${entry.label}`, 20);
+    }
+
+    function hideComboboxMenu(menu) {
+      menu.classList.add('hidden');
+      menu.innerHTML = '';
+    }
+
+    function renderComboboxMenu(menu, options, onPick) {
+      menu.innerHTML = '';
+      if (!options.length) {
+        const emptyItem = document.createElement('li');
+        emptyItem.className = 'muted';
+        emptyItem.textContent = '没有匹配的选项，可直接手动输入';
+        menu.appendChild(emptyItem);
+        menu.classList.remove('hidden');
+        return;
+      }
+      options.forEach(option => {
+        const item = document.createElement('li');
+        item.textContent = option.label;
+        item.addEventListener('mousedown', function(event) {
+          event.preventDefault();
+          onPick(option);
+          hideComboboxMenu(menu);
+        });
+        menu.appendChild(item);
+      });
+      menu.classList.remove('hidden');
+    }
+
+    function initCombobox({ input, menu, toggle, getOptions, onPick, onShow }) {
+      const showOptions = () => {
+        if (onShow) {
+          onShow();
+        }
+        renderComboboxMenu(menu, getOptions(input.value), onPick);
+      };
+
+      input.addEventListener('input', showOptions);
+      input.addEventListener('focus', showOptions);
+      input.addEventListener('blur', function() {
+        window.setTimeout(() => hideComboboxMenu(menu), 120);
+      });
+      toggle.addEventListener('click', function() {
+        if (menu.classList.contains('hidden')) {
+          showOptions();
+          input.focus();
+        } else {
+          hideComboboxMenu(menu);
+        }
+      });
+    }
+
+    function syncCityWithProvince() {
+      const province = resolveProvince(provinceInput.value);
+      if (!provinceCityMap[province] || !cityInput.value.trim()) {
+        return;
+      }
+      const city = cityInput.value.trim();
+      if (!provinceCityMap[province].includes(city)) {
+        const ranked = rankByRelevance(city, provinceCityMap[province], item => item, 1);
+        if (ranked[0]) {
+          cityInput.value = ranked[0];
+        }
+      }
+    }
 
     function switchMode(mode) {
       currentMode = mode;
@@ -246,35 +473,45 @@
       }
     }
 
-    function populateCitySuggestions(province) {
-      cityDataList.innerHTML = '';
-      if (!province || !provinceCityMap[province]) {
-        return;
-      }
-      provinceCityMap[province].forEach(city => {
-        const option = document.createElement('option');
-        option.value = city;
-        cityDataList.appendChild(option);
-      });
-    }
-
     function initOptions() {
-      Object.keys(provinceCityMap).forEach(prov => {
-        const option = document.createElement('option');
-        option.value = prov;
-        option.textContent = prov;
-        provinceSelect.appendChild(option);
-      });
-
-      labelSuggestions.forEach(label => {
+      dedupeLabelSuggestions(labelSuggestions).forEach(label => {
         const option = document.createElement('option');
         option.value = label;
         labelDataList.appendChild(option);
       });
 
-      provinceSelect.addEventListener('change', function() {
-        populateCitySuggestions(this.value);
+      initCombobox({
+        input: provinceInput,
+        menu: provinceMenu,
+        toggle: document.querySelector('#provinceCombobox .combobox-toggle'),
+        getOptions: getProvinceOptions,
+        onShow() {
+          hideComboboxMenu(cityMenu);
+        },
+        onPick(option) {
+          provinceInput.value = option.value;
+          syncCityWithProvince();
+        },
       });
+
+      initCombobox({
+        input: cityInput,
+        menu: cityMenu,
+        toggle: document.querySelector('#cityCombobox .combobox-toggle'),
+        getOptions: getCityEntries,
+        onShow() {
+          hideComboboxMenu(provinceMenu);
+        },
+        onPick(option) {
+          cityInput.value = option.city || option.value;
+          if (option.province) {
+            provinceInput.value = option.province;
+          }
+        },
+      });
+
+      provinceInput.addEventListener('change', syncCityWithProvince);
+      provinceInput.addEventListener('blur', syncCityWithProvince);
     }
 
     function confirmLocation() {
@@ -282,7 +519,7 @@
       const city = document.getElementById('city').value.trim();
       const status = document.getElementById('locationStatus');
       if (!province) {
-        status.textContent = '请选择省份。';
+        status.textContent = '请选择或输入省份。';
         status.className = 'confirm-box status error';
         return;
       }
@@ -320,7 +557,7 @@
         return false;
       }
       if (!province) {
-        status.textContent = '请选择省份。';
+        status.textContent = '请选择或输入省份。';
         status.className = 'status error';
         return false;
       }

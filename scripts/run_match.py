@@ -12,6 +12,24 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from codes.trial_matcher import build_patient_input, load_trials, rank_trials
 
 
+def render_matched_centers_summary(matched_centers: list, match_level: str) -> str:
+    if not matched_centers:
+        return '<span class="dim">无地理候选中心</span>'
+    hospitals = []
+    seen = set()
+    for center in matched_centers:
+        name = str(center.get("hospital") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        hospitals.append(name)
+    if not hospitals:
+        return '<span class="dim">无地理候选中心</span>'
+    level = match_level or matched_centers[0].get("match_level") or "-"
+    joined = "、".join(f'<span class="matched">{html.escape(name)}</span>' for name in hospitals)
+    return f"{html.escape(level)} · {joined}"
+
+
 def render_html(
     patient: dict, matches: list, match_mode: str = "strict", data_quality: dict | None = None
 ) -> str:
@@ -113,32 +131,10 @@ def render_html(
             + "</table>"
         ) if review_rows else "<p class='dim'>当前无待人工复核条款。</p>"
         
-        # 高亮最近的地点
         nearest = item.get('nearest_location')
-        province_str = str(trial.get('研究中心所在省份', '-'))
-        city_str = str(trial.get('研究中心所在城市', '-'))
-        
-        if nearest:
-            nearest_loc = nearest.get('location', '')
-            if nearest['type'] == 'city':
-                # 高亮city中最近的那个
-                cities = [c.strip() for c in city_str.split(',')]
-                city_str = '、'.join(
-                    f'<span class="matched">{html.escape(c)}</span>' if c == nearest_loc else html.escape(c)
-                    for c in cities
-                )
-            else:
-                # 高亮province中最近的那个
-                provinces = [p.strip() for p in province_str.split(',')]
-                province_str = '、'.join(
-                    f'<span class="matched">{html.escape(p)}</span>' if p == nearest_loc else html.escape(p)
-                    for p in provinces
-                )
-        else:
-            province_str = html.escape(province_str)
-            city_str = html.escape(city_str)
-        
-        summary_location = province_str + ' ' + city_str
+        matched_centers = item.get('matched_centers') or []
+        geo_match_level = item.get('geo_match_level') or (nearest or {}).get('match_level') or '-'
+        summary_location = render_matched_centers_summary(matched_centers, geo_match_level)
         patient_location = html.escape(str(patient.get('location') or '-'))
         matched_labels = item.get('matching_labels', [])
         labels = trial.get('labels', [])
@@ -147,7 +143,14 @@ def render_html(
             for label in labels
         ) or '-'
         location_match_text = '<span class="matched">匹配</span>' if item.get('location_match') else '<span class="dim">未匹配</span>'
-        geo_distance_text = f"{item.get('geo_distance'):.1f}" if isinstance(item.get('geo_distance'), (int, float)) else '-'
+        if isinstance(item.get('geo_distance'), (int, float)):
+            geo_distance_text = f"{item.get('geo_distance'):.1f} km"
+        elif item.get('geo_match_level'):
+            geo_distance_text = str(item.get('geo_match_level'))
+        elif nearest and nearest.get('match_level'):
+            geo_distance_text = str(nearest.get('match_level'))
+        else:
+            geo_distance_text = '-'
         review_note = ""
         if item.get("needs_review"):
             trial_missing = item.get("missing_core_messages") or []
@@ -171,8 +174,8 @@ def render_html(
           <button class="toggle-btn" onclick="toggleDetail('detail-{idx}')">
             <div class="summary-left">
               <div class="trial-title">{idx}. {html.escape(item.get('trial_name') or item.get('trial_id') or '未知试验')}</div>
-              <div class="trial-meta">试验编码: {html.escape(str(item.get('trial_id')))} | 总分: {item.get('score', 0):.1f} | 地理排序: {item.get('geo_rank')} | 距离: {geo_distance_text} km</div>
-              <div class="trial-meta location-meta">患者位置: {patient_location} → 研究中心: {summary_location}</div>
+              <div class="trial-meta">试验编码: {html.escape(str(item.get('trial_id')))} | 总分: {item.get('score', 0):.1f} | 地理排序: {item.get('geo_rank')} | 地理: {geo_distance_text}</div>
+              <div class="trial-meta location-meta">患者位置: {patient_location} → 候选中心: {summary_location}</div>
             </div>
           </button>
           <div id="detail-{idx}" class="detail">
@@ -180,7 +183,7 @@ def render_html(
               <h3>符合信息</h3>
               <p><strong>患者诊断:</strong> {html.escape(str(patient.get('diagnosis') or '-'))}</p>
               <p><strong>试验疾病标签:</strong> {labels_html}</p>
-              <p><strong>研究中心地点:</strong> {summary_location} {location_match_text}</p>
+              <p><strong>候选研究中心:</strong> {summary_location} {location_match_text}</p>
             </div>
             <div class="detail-block">
               <h3>匹配结果</h3>
@@ -188,7 +191,7 @@ def render_html(
               {f'<p><strong>核对提示:</strong> {review_note}</p>' if review_note else ''}
               <p><strong>疾病匹配:</strong> {'✔' if item.get('disease_match') else '✖'}</p>
               <p><strong>硬规则通过:</strong> 年龄 {rule_icon('age', item.get('age_pass'))} / 性别 {rule_icon('gender', item.get('gender_pass'))} / ECOG {rule_icon('ecog', item.get('ecog_pass'))} / 治疗线数 {rule_icon('treatment_lines', item.get('treatment_lines_pass'))} / 化验 {'✔' if item.get('lab_pass') else '✖'}</p>
-              <p><strong>地理得分:</strong> {item.get('geo_rank')} | <strong>距离:</strong> {geo_distance_text} km</p>
+              <p><strong>地理得分:</strong> {item.get('geo_rank')} | <strong>地理匹配:</strong> {geo_distance_text}</p>
               <p><strong>匹配理由 / 问题:</strong> {reasons_html}</p>
               <p><strong>建议补充:</strong> {next_steps_html}</p>
             </div>
@@ -206,9 +209,7 @@ def render_html(
                 <tr><th>疾病三级标签</th><td>{labels_html}</td></tr>
                 <tr><th>入组条件</th><td><pre>{html.escape(str(trial.get('入组条件', '-')))}</pre></td></tr>
                 <tr><th>排除条件</th><td><pre>{html.escape(str(trial.get('排除条件', '-')))}</pre></td></tr>
-                <tr><th>研究中心省份</th><td class="{'matched' if nearest and nearest['type'] == 'province' else ''}">{html.escape(str(trial.get('研究中心所在省份', '-')))}</td></tr>
-                <tr><th>研究中心城市</th><td class="{'matched' if nearest and nearest['type'] == 'city' else ''}">{html.escape(str(trial.get('研究中心所在城市', '-')))}</td></tr>
-                <tr><th>研究医院</th><td>{html.escape(str(trial.get('研究医院', '-')))}</td></tr>
+                <tr><th>候选研究中心</th><td>{summary_location}</td></tr>
               </table>
             </div>
           </div>

@@ -1,13 +1,18 @@
+import importlib
 import json
 import os
 import sys
+import threading
 import urllib.parse
+import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 
 # 添加父目录到Python路径，以便导入codes和run_match模块
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS_DIR = PROJECT_ROOT / "scripts"
 sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(SCRIPTS_DIR))
 
 from codes.lab_normalize import attach_lab_observations, normalize_ocr_lab_payload
 from codes.trial_matcher import (
@@ -16,7 +21,7 @@ from codes.trial_matcher import (
     rank_trials,
     summarize_patient_data_quality,
 )
-from run_match import render_html, save_html
+import run_match
 
 ROOT_DIR = PROJECT_ROOT
 TRIAL_JSON_PATH = ROOT_DIR / 'original_data' / 'clinical_trials' / 'trials_structured.json'
@@ -42,13 +47,42 @@ def parse_match_mode(value: str) -> str:
     return mode if mode in ("strict", "balanced") else "strict"
 
 
+def patient_for_json_export(patient: dict) -> dict:
+    """去掉匹配过程中写入的运行时缓存，保证可 JSON 序列化。"""
+    export = dict(patient)
+    location_info = export.pop("_location_info", None)
+    if location_info is not None and hasattr(location_info, "to_dict"):
+        parsed = location_info.to_dict()
+        if parsed.get("display") and not export.get("location"):
+            export["location"] = parsed["display"]
+        if parsed.get("adcode") and not export.get("location_adcode"):
+            export["location_adcode"] = parsed["adcode"]
+    return export
+
+
 class DemoHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path in ('', '/', '/index.html'):
             self.path = '/web/demo_input.html'
         elif self.path == '/demo_input.html':
             self.path = '/web/demo_input.html'
+        if self.path.startswith('/output_patients/patient_trial_matches.html'):
+            return self.serve_match_result_html()
         return super().do_GET()
+
+    def serve_match_result_html(self):
+        result_path = OUTPUT_DIR / 'patient_trial_matches.html'
+        if not result_path.exists():
+            self.send_error(404, '匹配结果尚未生成，请先提交表单运行匹配。')
+            return
+        content = result_path.read_text(encoding='utf-8')
+        body = content.encode('utf-8')
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Cache-Control', 'no-store, no-cache, must-revalidate')
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         if self.path == '/run_match_json':
@@ -87,7 +121,11 @@ class DemoHandler(SimpleHTTPRequestHandler):
         normalize_ocr_lab_payload(patient)
         attach_lab_observations(patient)
 
-        self._run_and_persist(patient, match_mode)
+        try:
+            self._run_and_persist(patient, match_mode)
+        except Exception as exc:
+            self.send_error_response(500, f'匹配失败: {exc}')
+            return
 
         self.send_response(303)
         self.send_header('Location', '/output_patients/patient_trial_matches.html')
@@ -101,13 +139,21 @@ class DemoHandler(SimpleHTTPRequestHandler):
         output_json_path = OUTPUT_DIR / 'patient_trial_matches.json'
         with output_json_path.open('w', encoding='utf-8') as f:
             json.dump(
-                {'patient': patient, 'match_mode': match_mode, 'data_quality': data_quality, 'matches': matches},
+                {
+                    'patient': patient_for_json_export(patient),
+                    'match_mode': match_mode,
+                    'data_quality': data_quality,
+                    'matches': matches,
+                },
                 f,
                 ensure_ascii=False,
                 indent=2,
             )
-        html_text = render_html(patient, matches, match_mode=match_mode, data_quality=data_quality)
-        save_html(OUTPUT_DIR, html_text)
+        run_match_module = importlib.reload(run_match)
+        html_text = run_match_module.render_html(
+            patient, matches, match_mode=match_mode, data_quality=data_quality
+        )
+        run_match_module.save_html(OUTPUT_DIR, html_text)
 
     def handle_json_match(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -146,7 +192,16 @@ class DemoHandler(SimpleHTTPRequestHandler):
         patient.setdefault('lab_results', [])
         normalize_ocr_lab_payload(patient)
         attach_lab_observations(patient)
-        self._run_and_persist(patient, match_mode)
+        try:
+            self._run_and_persist(patient, match_mode)
+        except Exception as exc:
+            self.send_response(500)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(
+                json.dumps({'error': f'匹配失败: {exc}'}, ensure_ascii=False).encode('utf-8')
+            )
+            return
 
         self.send_response(200)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -158,9 +213,17 @@ class DemoHandler(SimpleHTTPRequestHandler):
             ).encode('utf-8')
         )
 
+    def send_error_response(self, status: int, message: str):
+        self.send_response(status)
+        self.send_header('Content-Type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(message.encode('utf-8'))
+
 
 if __name__ == '__main__':
     os.chdir(str(ROOT_DIR))
+    warm_trials = load_trials(str(TRIAL_JSON_PATH))
+    print(f'已预加载 {len(warm_trials)} 条试验（含研究中心地理缓存）。')
 
     host = '127.0.0.1'
     port = 8000
@@ -168,6 +231,8 @@ if __name__ == '__main__':
         (host, port),
         lambda *args, **kwargs: DemoHandler(*args, directory=str(ROOT_DIR), **kwargs)
     )
-    print(f'Demo server running at http://{host}:{port}/')
-    print('打开浏览器访问输入页面，填写后提交即可查看匹配结果。')
+    url = f'http://{host}:{port}/'
+    print(f'Demo server running at {url}')
+    print('正在自动打开浏览器，填写表单后提交即可查看匹配结果。')
+    threading.Timer(0.3, lambda: webbrowser.open(url)).start()
     server.serve_forever()

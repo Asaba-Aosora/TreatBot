@@ -49,6 +49,73 @@ STAGE_PATTERNS = [
     (r"[Ⅰ1]期|I期", "I"),
 ]
 
+# 括号内临床分期，如 （Ⅳ）、(IV)
+PAREN_STAGE_RE = re.compile(r"[（(]\s*([^）)]+?)\s*[）)]")
+
+# TNM M1 / TXNXM1 → 临床 IV 期（远处转移）
+TNM_M1_RE = re.compile(
+    r"TXNXM1\b|"
+    r"T[0-9Xx][cCp]?[Nn][0-9Xx][cCp]?[Mm]1\b|"
+    r"[cp]M1\b|"
+    r"(?<![A-Za-z0-9])M1(?![0-9])",
+    re.I,
+)
+
+_PAREN_STAGE_TOKEN: Dict[str, str] = {
+    "Ⅳ": "IV",
+    "4": "IV",
+    "IV": "IV",
+    "Ⅲ": "III",
+    "3": "III",
+    "III": "III",
+    "Ⅱ": "II",
+    "2": "II",
+    "II": "II",
+    "Ⅰ": "I",
+    "1": "I",
+    "I": "I",
+}
+
+
+def _stage_from_paren_token(token: str) -> Optional[str]:
+    t = re.sub(r"\s+", "", (token or "").strip())
+    if not t or len(t) > 6:
+        return None
+    if t in _PAREN_STAGE_TOKEN:
+        return _PAREN_STAGE_TOKEN[t]
+    upper = t.upper()
+    if upper in _PAREN_STAGE_TOKEN:
+        return _PAREN_STAGE_TOKEN[upper]
+    for prefix, stage in (("IV", "IV"), ("III", "III"), ("II", "II")):
+        if upper.startswith(prefix):
+            return stage
+    if t.startswith("Ⅳ"):
+        return "IV"
+    if t.startswith("Ⅲ"):
+        return "III"
+    if t.startswith("Ⅱ"):
+        return "II"
+    if t.startswith("Ⅰ"):
+        return "I"
+    return None
+
+
+def infer_stage_from_text(text: str) -> Optional[str]:
+    """从诊断等自由文本推断罗马数字分期（I–IV）。"""
+    blob = str(text or "")
+    if not blob:
+        return None
+    for pat, stage in STAGE_PATTERNS:
+        if re.search(pat, blob, re.I):
+            return stage
+    for m in PAREN_STAGE_RE.finditer(blob):
+        stage = _stage_from_paren_token(m.group(1))
+        if stage:
+            return stage
+    if TNM_M1_RE.search(blob):
+        return "IV"
+    return None
+
 #  Item 含以下子串时，勿映射到某些 metric（避免 Hb/MCHC、白蛋白/前白蛋白混淆）
 EXCLUDE_IF_CONTAINS: Dict[str, List[str]] = {
     "hb": ["mchc", "mch", "mcv", "rdw", "压积", "hct"],
@@ -273,13 +340,11 @@ def extract_biomarkers(patient: Dict[str, Any], raw_ocr_texts: List[str]) -> Lis
 
 
 def infer_cancer_stage(patient: Dict[str, Any]) -> Optional[str]:
-    if patient.get("cancer_stage"):
-        return str(patient["cancer_stage"])
-    diag = str(patient.get("diagnosis") or "")
-    for pat, stage in STAGE_PATTERNS:
-        if re.search(pat, diag, re.I):
-            return stage
-    return None
+    existing = patient.get("cancer_stage")
+    if existing:
+        normalized = infer_stage_from_text(str(existing))
+        return normalized or str(existing).strip() or None
+    return infer_stage_from_text(str(patient.get("diagnosis") or ""))
 
 
 def _merge_metric_rows(

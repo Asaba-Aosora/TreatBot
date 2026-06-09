@@ -1,6 +1,10 @@
 # 有救AI — 患者临床试验智能匹配系统
 
-**核心功能**：从病历（PDF）或手填信息提取患者画像，与临床试验库做**规则匹配 + 向量语义匹配**，按匹配度、地理距离等维度排序输出候选试验。
+**核心功能**：从病历（PDF）或手填信息提取患者画像，与 **496 条**招募中临床试验做**规则匹配 + 软语义排序**（地理距离、Jaccard），输出候选试验列表。
+
+**产品定位**：给医生**筛选建议**——缺 ECOG、化验等核心字段时标「待核对」，**不因信息不全而零候选**（`matcher_layers_v2` 筛查模式）。**不是**自动入组决策。
+
+**默认匹配入口**：`rank_trials`（规则引擎）。Faiss / 向量库有建库脚本，**尚未接入** `demo_server` 与默认 OCR 流水线。
 
 ---
 
@@ -10,16 +14,20 @@
 
 | 功能 | 核心文件 | 说明 |
 |------|--------|------|
-| **规则匹配引擎** | `codes/trial_matcher.py` | 支持入排条件、化验指标、生物标志物等多维度规则匹配 |
-| **化验结果归一化** | `codes/lab_normalize.py` | 自动将非结构化化验结果转换为标准化指标与观测值 |
-| **OCR（云端）** | `codes/ocr_cloud.py` | 支持豆包、Kimi、阿里云等多家云厂商API |
-| **OCR（本地）** | `codes/ocr_ollama.py` | 基于本地 Ollama 视觉模型，离线运行 |
-| **向量索引框架** | `codes/rag_index.py` | 基于哈希的试验条款向量化与向量搜索 (256维) |
-| **向量索引构建** | `scripts/build_trial_index.py` | 将试验入排条件拆分为 chunks 并向量化 |
-| **语义相似度** | `codes/trial_matcher.py::semantic_similarity()` | 基于 token 集合的语义相似度计算，已融入排序 |
-| **Web 匹配界面** | `web/demo_input.html` + `scripts/demo_server.py` | 手动录入模式 / OCR JSON 上传模式 |
-| **FastAPI 后端** | `api/server.py` | 可供外部系统集成的 REST API |
-| **医学领域词汇库** | `codes/lab_lexicon.py`, `lab_rules.py` | 化验指标、操作符、单位的标准化映射 |
+| **规则匹配引擎 v2** | `codes/trial_matcher.py` | 筛查语义：`eligible` / `needs_review` / `hard_excluded`；12 项化验按试验条款 pass/fail/unknown |
+| **化验结果归一化** | `codes/lab_normalize.py` | `lab_results` → `lab_observations`（12 项 metric_id） |
+| **患者整理（normalize）** | `codes/patient_matching_normalize.py` | 化验 curated、biomarker、分期推断、`_matching_normalize_report` |
+| **文件名推断** | `codes/patient_filename_infer.py` | 从 PDF 名补癌种 / 线数 / 地点（仅补缺失） |
+| **地理距离** | `codes/geo_admin.py` | cpca + adcode，多中心最短距离排序 |
+| **OCR（云端）** | `codes/ocr_cloud.py` | 豆包 hybrid / Kimi / 阿里云；PDF → 结构化 JSON |
+| **批量 OCR** | `scripts/batch_ocr.py` | 递归扫描 `dataset_patient`，跳过已成功 JSON |
+| **化验清洗** | `scripts/fix_lab_result.py` | ↑↓ 状态、非化验行分离 |
+| **匹配整理 CLI** | `scripts/normalize_patient_for_matching.py` | 产出 `*_fixed_matching.json`（**匹配金标准输入**） |
+| **OCR（本地）** | `codes/ocr_ollama.py` | 基于 Ollama 视觉模型，离线运行 |
+| **Web 匹配界面** | `web/demo_input.html` + `scripts/demo_server.py` | 手动录入 / 上传 OCR JSON |
+| **FastAPI 后端** | `api/server.py` | REST API 集成 |
+| **医学领域词汇库** | `codes/lab_lexicon.py`, `lab_rules.py` | 化验别名、×ULN 部分支持 |
+| **向量索引（实验）** | `codes/rag_index.py`, `scripts/build_trial_index.py` | 哈希向量方案；**默认匹配未使用** |
 
 ---
 
@@ -27,11 +35,14 @@
 
 | 优先级 | 任务 | 预期效果 |
 |-------|------|--------|
-| **🔴 高** | 集成真实 embedding 模型（CLIP / 医学 BERT） | 替换当前哈希方案，显著提升语义匹配准确度 |
-| **🔴 高** | 集成向量数据库（Faiss / Milvus） | 支持百万级试验库的高效向量检索 |
-| **🟡 中** | 医学 LLM 结构化提取优化 | 针对医学文本的更精准 OCR 后处理 |
-| **🟡 中** | 患者/试验元数据补全（知识图谱）| 地理位置、医疗机构、医生信息丰富化 |
-| **🟢 低** | 可视化匹配解释（Explainability） | 用户界面展示每个匹配的得分分解 |
+| **🔴 高** | OCR 稳定性：超时页重试、漏检病例重跑 | 化验进系统率提升（当前主要瓶颈） |
+| **🔴 高** | 10+ 病例医生标注 Top 候选是否合理 | 评测驱动规则迭代 |
+| **🟡 中** | 化验 ×ULN、biomarker 硬规则扩展 | 更贴近试验入排原文 |
+| **🟡 中** | 诊断规范化（`diagnosis_raw` / `cancer_type`） | 减少零候选（标签未对齐） |
+| **🟢 低** | 接入 Faiss / 真实 embedding | 规则满足后语义召回与排序 |
+| **🟢 低** | 匹配解释 UI | 得分分解、待核对项展示 |
+
+> 阶段性评测与 OCR 漏检分析见 [docs/STAGE_REPORT.md](docs/STAGE_REPORT.md)。
 
 ---
 
@@ -156,36 +167,48 @@ python scripts/run_match.py
 
 ---
 
-### 方式 4️⃣ : OCR 病历提取（需要 API 密钥）
+### 方式 4️⃣ : 病历 PDF 全流程（推荐，需要 API 密钥）
 
-#### OCR Demo（云端）
+**推荐流水线**（金标准工作文件为 `*_fixed_matching.json`）：
+
+```powershell
+# 1. 批量 OCR（默认跳过已有 success JSON）
+python scripts/batch_ocr.py
+
+# 2. 化验清洗（可选，OCR 脏数据多时建议）
+python scripts/fix_lab_result.py input.json output_fixed.json
+
+# 3. 整理为匹配输入 + 可选预览 Top 候选
+python scripts/normalize_patient_for_matching.py --file output_patients/xxx_fixed.json --run-match
+```
+
+单份交互式 OCR：
+
 ```bash
 python scripts/ocr_demo.py
 ```
-- 选择 PDF 病历文件
-- 系统调用配置的云端 OCR API（豆包/Kimi 等）
-- 输出结构化 JSON 到 `output_patients/`
+
+PDF 样本目录：`original_data/dataset_patient/`（文件名建议含 `{癌种}{线数}{地点}`，如 `CHQI胰腺癌辽宁沈阳.pdf`）。
 
 #### OCR 本地化（Ollama）
-```bash
-# 先启动 Ollama 服务
-ollama serve
 
-# 另开终端，运行 OCR 脚本
+```bash
+ollama serve
 python scripts/run_ocr.py
 ```
+
 详细步骤见 [docs/OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md)。
 
 ---
 
-### 方式 5️⃣ : 向量索引构建（RAG 基础）
+### 方式 5️⃣ : 向量索引构建（实验，默认匹配未使用）
 
 ```bash
 python scripts/build_trial_index.py
 ```
-- 读取 `original_data/clinical_trials/trials_structured.json`
-- 将试验入排条件向量化并存储为 `structured_data/vector_index/trial_criteria_index.json`
-- 输出：`Chunk数量: <N>`
+
+- 读取 `trials_structured.json`，生成 `structured_data/vector_index/trial_criteria_index.json`
+- 当前 **demo / rank_trials 默认不走此索引**；见 [QUICKSTART_VECTOR_DB.md](docs/QUICKSTART_VECTOR_DB.md)
 
 ---
 
@@ -206,12 +229,10 @@ python scripts/build_trial_index.py
 │                                     # └─ Swagger 自动生成文档
 │
 ├─ codes/                             # 核心业务逻辑
-│  ├─ trial_matcher.py                # ⭐ 匹配引擎（规则、语义、排序）
-│  │                                  #    ├─ build_patient_input()
-│  │                                  #    ├─ load_trials()
-│  │                                  #    ├─ rank_trials()
-│  │                                  #    ├─ semantic_similarity()
-│  │                                  #    └─ summarize_patient_data_quality()
+│  ├─ trial_matcher.py                # ⭐ 匹配引擎 v2（rank_trials / match_trial）
+│  ├─ patient_matching_normalize.py   # OCR 患者 JSON → 匹配输入
+│  ├─ patient_filename_infer.py       # 文件名 → 癌种/线数/地点
+│  ├─ geo_admin.py                    # 省市区 → adcode / 距离
 │  │
 │  ├─ lab_normalize.py                # 化验结果标准化
 │  │                                  #    ├─ normalize_ocr_lab_payload()
@@ -249,10 +270,12 @@ python scripts/build_trial_index.py
 │  ├─ run_api.py                      # ⭐ FastAPI 后端启动
 │  ├─ run_match.py                    # 离线匹配脚本（手写患者数据）
 │  │
-│  ├─ ocr_demo.py                     # OCR 演示入口
-│  ├─ run_ocr.py                      # 本地 Ollama OCR 运行脚本
+│  ├─ batch_ocr.py                    # ⭐ 批量 PDF OCR（跳过已成功）
+│  ├─ normalize_patient_for_matching.py  # ⭐ 整理 → *_matching.json
+│  ├─ ocr_demo.py                     # 单份 OCR 交互入口
+│  ├─ run_ocr.py                      # 本地 Ollama OCR
 │  │
-│  ├─ build_trial_index.py            # 向量索引构建脚本
+│  ├─ build_trial_index.py            # 向量索引构建（实验，默认未接入匹配）
 │  ├─ build_learning_artifacts.py     # 学习工件构建
 │  ├─ parse_trials_to_rules.py        # 试验规则解析
 │  ├─ sync_trials.py                  # 试验库同步
@@ -273,10 +296,14 @@ python scripts/build_trial_index.py
 │  ├─ test_matcher_v2.py              # 匹配引擎测试
 │  ├─ test_lab_normalize.py           # 化验归一化测试
 │  ├─ test_ocr_cloud.py               # OCR 测试
-│  ├─ test_geo.py                     # 地理距离测试
+│  ├─ test_geo_admin.py               # 地理 / adcode 测试
+│  ├─ test_filename_and_disease_match.py  # 文件名推断、分期、疾病匹配
 │  └─ test_real_data.py               # 真实数据集成测试
 │
 ├─ docs/                              # 文档与说明
+│  ├─ STAGE_REPORT.md                 # ⭐ 阶段性汇报（10 例评测）
+│  ├─ SESSION_HANDOFF.md              # 开发交接与命令速查
+│  ├─ MATCHING_CHECKLIST.md           # 匹配规则与 12 项化验清单
 │  ├─ QUICK_START.md                  # 快速开始指南
 │  ├─ OLLAMA_GUIDE.md                 # 本地 Ollama 详细步骤
 │  ├─ IMPLEMENTATION_SPEC.md          # 实现细节与 schema 约定
@@ -299,8 +326,11 @@ python scripts/build_trial_index.py
 │     └─ trial_criteria_index.json    # 向量索引（build_trial_index.py 生成）
 │
 └─ output_patients/                   # 运行输出（.gitignore）
-   ├─ patient_trial_matches.html      # 📄 最终匹配结果（Web 界面）
-   ├─ patient_trial_matches.json      # 匹配结果 JSON
+   ├─ *_患者信息.json                  # OCR 原始输出
+   ├─ *_fixed.json                    # 化验清洗后
+   ├─ *_fixed_matching.json          # ⭐ 匹配金标准输入
+   ├─ patient_trial_matches.html      # 离线匹配 HTML 报告
+   ├─ batch_ocr.log                   # 批量 OCR 日志
    └─ temp_images/                    # 临时 OCR 图片缓存
 ```
 
@@ -350,51 +380,38 @@ python scripts/benchmark_match_from_ocr_json.py \
 
 ## 迭代工作流（推荐）
 
-### 完整闭环：OCR → 标注 → 评测 → 优化
+### 完整闭环：OCR → fix → normalize → 匹配 → 评测
 
-1. **OCR 病历**
+1. **OCR** — `batch_ocr.py` 或 `ocr_demo.py` → `*_患者信息.json`
+2. **化验清洗** — `fix_lab_result.py` → `*_fixed.json`（OCR 脏数据多时建议）
+3. **匹配整理** — `normalize_patient_for_matching.py` → `*_fixed_matching.json`
+4. **医生补全** — ECOG、P0 化验等（见 normalize 报告 `missing_p0_metrics`）
+5. **匹配评测**
    ```bash
-   python scripts/ocr_demo.py
-   # 生成 output_patients/patient_info.json
+   python scripts/benchmark_match_from_ocr_json.py --dir output_patients --match-mode strict
+   python scripts/run_match.py   # 生成 HTML 报告
    ```
-
-2. **医生标注修订**（人工审核，生成 `*_fixed.json`）
-
-3. **评测 OCR 质量**
+6. **OCR 金标准评测**（有 `*_fixed.json` 时）
    ```bash
    python scripts/eval_ocr_gold.py --raw <raw.json> --gold <fixed.json>
    ```
-
-4. **验证匹配稳定性**（用修订后的患者数据）
-   ```bash
-   # 严格模式
-   python scripts/benchmark_match_from_ocr_json.py --file <fixed.json> --match-mode strict
-   
-   # 平衡模式
-   python scripts/benchmark_match_from_ocr_json.py --file <fixed.json> --match-mode balanced
-   ```
-
-5. **回归测试**（确保无功能退化）
-   ```bash
-   pytest tests/ -v
-   ```
+7. **回归测试** — `pytest tests/test_matcher_v2.py tests/test_geo_admin.py -q`
 
 ### 关键指标
 
-- OCR 结构化准确度（精准率/召回率）
-- 匹配耗时 < 100ms per patient
-- 平衡模式候选试验数稳定（通常 5-20 个）
-- 高分候选与临床实际相符度
+- OCR：页级 timeout 率、P0 化验进系统率（见 [STAGE_REPORT.md](docs/STAGE_REPORT.md)）
+- 匹配：候选数、`needs_review` / `eligible` 比例、疾病 Top1 标签是否正确
+- 性能：单患者 × 496 试验约数秒级（取决于硬件）
 
 ---
 
 ## 试验与患者数据
 
-- **试验库**：`original_data/clinical_trials/trials_structured.json`  
-  若本地未放置数据，请先按团队数据流程同步。
+- **试验库**：`original_data/clinical_trials/trials_structured.json`（**496** 条招募中项目）  
+  同步脚本：`scripts/sync_xlsx_to_trials_json.py`
 
-- **病历样本**：`original_data/dataset_patient/`  
-  由 `.gitignore` 忽略，请自建目录放置 PDF 样本。
+- **病历样本**：`original_data/dataset_patient/`（PDF；可含子目录）  
+  当前阶段已 OCR + normalize **10** 例，详见 [STAGE_REPORT.md](docs/STAGE_REPORT.md)。
 
 ---
 
@@ -415,17 +432,18 @@ python scripts/benchmark_match_from_ocr_json.py \
 
 ### Q3: 为什么某个试验排名很靠后？
 **A：** 匹配分数由多个维度组成：
-- **规则匹配**（入排条件）：权重最高
-- **化验指标**：权重次高
-- **地理距离**：权重较低
-- **语义相似度**：补充维度
+- **疾病匹配**、年龄/性别/ECOG/线数/化验 hard 规则
+- **地理距离**、入排全文 Jaccard 软语义
+- 缺 core 字段每条扣 3 分
 
-查看 HTML 结果页面中的"检查详情"表格，可看到每个试验的逐项评分。
+查看结果中的 `reasons`、`review_items`、`checks` 了解逐项判定。
 
 ### Q4: 如何切换匹配模式？
-**A：** 系统提供两种模式：
-- **严格模式**（`strict`）：要求所有入排条件严格符合
-- **平衡模式**（`balanced`）：允许部分条件模糊匹配，候选更多
+**A：** 两种模式：
+- **strict**（默认）：入组化验 fail → 不进候选列表
+- **balanced**：入组化验 fail ≤ 1 仍可进列表
+
+缺 ECOG/化验 unknown **不会**因此 hard_excluded，仅标 `needs_review`。
 
 Web 表单和 API 都支持选择。
 
@@ -437,10 +455,10 @@ Web 表单和 API 都支持选择。
 4. 详见 [docs/IMPLEMENTATION_SPEC.md](docs/IMPLEMENTATION_SPEC.md) 部署章节
 
 ### Q6: 向量索引有什么用？
-**A：** 当前向量索引（`rag_index.py`）：
-- 用于在试验入排条件中做语义检索（补充规则匹配）
-- 目前采用简化的哈希方案
-- 计划升级为真实 embedding 模型（CLIP / 医学 BERT）
+**A：** `rag_index.py` / `build_trial_index.py` 为**实验模块**：
+- 当前默认匹配走 `rank_trials` 规则引擎，**未接入** Faiss
+- 哈希向量方案；后续可选升级 embedding + 向量库
+- 详见 [QUICKSTART_VECTOR_DB.md](docs/QUICKSTART_VECTOR_DB.md)
 
 ---
 
@@ -450,7 +468,8 @@ Web 表单和 API 都支持选择。
 |------|--------|
 | `ModuleNotFoundError: codes` | 确保在项目根目录运行脚本；检查 `sys.path.insert(0, ...)` |
 | API 返回 400 Bad Request | 检查 JSON 格式；必须包含 `patient.diagnosis` 或 `cancer_type` |
-| OCR 结果为空 | 检查 API 密钥有效性；检查 PDF 质量（清晰度、页数） |
+| OCR 结果为空 / timeout | 检查 API 密钥与余额；见 `errors` 字段；可单份重跑 `batch_ocr.py` |
+| 化验全缺但 PDF 里有 | 多为 OCR 漏检（页 timeout），非匹配 bug；重跑 OCR 或人工补录 |
 | 匹配耗时过长 | 检查试验库大小；可用 `--max-trials` 参数限制（见脚本 --help） |
 | 化验项无法识别 | 检查 `lab_lexicon.py` 是否包含该项代码；提交反馈以扩展词汇库 |
 
@@ -460,6 +479,10 @@ Web 表单和 API 都支持选择。
 
 | 文档 | 说明 |
 |------|------|
+| [docs/NLP_FINAL_REPORT.md](docs/NLP_FINAL_REPORT.md) | **NLP 课程期末项目报告**（IE + 文本匹配） |
+| [docs/STAGE_REPORT.md](docs/STAGE_REPORT.md) | **阶段性汇报**：10 例评测、OCR 漏检分析 |
+| [docs/SESSION_HANDOFF.md](docs/SESSION_HANDOFF.md) | 开发交接、常用命令 |
+| [docs/MATCHING_CHECKLIST.md](docs/MATCHING_CHECKLIST.md) | 匹配规则、12 项化验、v2 筛查语义 |
 | [docs/QUICK_START.md](docs/QUICK_START.md) | 环境配置、常见问题、初始化步骤 |
 | [docs/OLLAMA_GUIDE.md](docs/OLLAMA_GUIDE.md) | Ollama 本地部署、模型下载、性能优化 |
 | [docs/IMPLEMENTATION_SPEC.md](docs/IMPLEMENTATION_SPEC.md) | 接口约定、数据结构、匹配算法详解 |
@@ -483,6 +506,6 @@ MIT License — 详见 `LICENSE` 文件
 
 ---
 
-**最后更新**：2026-05-14  
-**当前版本**：v1.0 (Beta)  
-**核心功能**：✅ 规则匹配 | ✅ 向量索引框架 | 🚀 实际 embedding 集成中
+**最后更新**：2026-06-03  
+**匹配引擎**：`matcher_layers_v2`（筛查模式）  
+**核心功能**：✅ PDF→matching 流水线 | ✅ 496 试验规则匹配 | ⏳ OCR 稳定性 / Faiss 待迭代

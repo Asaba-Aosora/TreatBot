@@ -4,9 +4,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from codes.geo_admin import (
+    build_trial_centers,
+    build_trial_sites,
     compute_geo_distance,
+    ensure_patient_location_info,
     find_nearest_trial_site,
-    geo_score,
+    geo_match_admin,
     parse_trial_site_pairs,
     province_prefix_match,
     resolve_coord,
@@ -46,9 +49,59 @@ def find_location_coord(location: str) -> Optional[Tuple[float, float]]:
     return resolve_coord(location)
 
 
-def find_nearest_location(patient_location: str, province: str, city: str) -> Optional[Dict]:
-    """找出试验中距患者最近的具体地点及距离，用于高亮。"""
-    return find_nearest_trial_site(patient_location, province, city)
+def find_nearest_location(
+    patient_location: str,
+    province: str,
+    city: str,
+    *,
+    patient_info=None,
+    sites=None,
+) -> Optional[Dict]:
+    """找出试验中地理最匹配的研究中心，用于高亮。"""
+    return find_nearest_trial_site(
+        patient_location,
+        province,
+        city,
+        patient_info=patient_info,
+        sites=sites,
+    )
+
+
+def _minimal_non_match_result(trial: Dict) -> Dict[str, Any]:
+    return {
+        "trial_id": trial.get("项目编码"),
+        "trial_name": trial.get("项目名称")
+        or trial.get("研究中心所在医院")
+        or trial.get("研究中心所在城市"),
+        "disease_match": False,
+        "matching_labels": [],
+        "location_match": False,
+        "age_pass": True,
+        "gender_pass": True,
+        "ecog_pass": True,
+        "treatment_lines_pass": True,
+        "lab_pass": True,
+        "eligible": False,
+        "hard_excluded": False,
+        "needs_review": False,
+        "missing_core_fields": [],
+        "missing_core_messages": [],
+        "exclusion_triggered": False,
+        "inclusion_lab_failed": False,
+        "checks": [],
+        "next_steps": [],
+        "matcher_version": MATCHER_VERSION,
+        "match_mode": "strict",
+        "geo_rank": 99,
+        "geo_distance": None,
+        "geo_match_level": None,
+        "nearest_location": None,
+        "semantic_score": 0.0,
+        "score": 0.0,
+        "reasons": [],
+        "review_items": [],
+        "trial": trial,
+    }
 
 
 def extract_age(text: str) -> Tuple[Optional[int], Optional[int]]:
@@ -321,10 +374,20 @@ def parse_trial_condition(trial: Dict) -> Dict:
     }
 
 
+_TRIALS_CACHE: Dict[str, Dict[str, Any]] = {}
+
+
 def load_trials(json_path: str) -> List[Dict]:
     path = Path(json_path)
     if not path.exists():
         raise FileNotFoundError(f"试验数据文件不存在: {json_path}")
+
+    cache_key = str(path.resolve())
+    mtime = path.stat().st_mtime
+    cached = _TRIALS_CACHE.get(cache_key)
+    if cached and cached.get("mtime") == mtime:
+        return cached["trials"]
+
     with path.open('r', encoding='utf-8') as f:
         trials = json.load(f)
 
@@ -332,6 +395,16 @@ def load_trials(json_path: str) -> List[Dict]:
         base = parse_trial_condition(trial)
         trial["parsed_conditions"] = enrich_parsed_conditions(trial, base)
         trial['labels'] = split_labels(trial.get('疾病三级标签', ''))
+        trial["parsed_centers"] = build_trial_centers(
+            trial.get("研究中心所在省份", ""),
+            trial.get("研究中心所在城市", ""),
+            trial.get("研究医院", ""),
+        )
+        trial["parsed_sites"] = build_trial_sites(
+            trial.get("研究中心所在省份", ""),
+            trial.get("研究中心所在城市", ""),
+        )
+    _TRIALS_CACHE[cache_key] = {"mtime": mtime, "trials": trials}
     return trials
 
 
@@ -343,6 +416,8 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
     labels = trial.get('labels', [])
     matching_labels = find_matching_labels(patient_diag, labels)
     disease_match = bool(matching_labels)
+    if not disease_match:
+        return _minimal_non_match_result(trial)
 
     condition = trial.get('parsed_conditions', {})
     age_pass = True
@@ -437,7 +512,15 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
     location = patient.get('location')
     province = trial.get('研究中心所在省份', '')
     city = trial.get('研究中心所在城市', '')
-    geo_rank, geo_distance = geo_score(location, province, city)
+    patient_info = ensure_patient_location_info(patient)
+    hospital = trial.get("研究医院", "")
+    trial_centers = trial.get("parsed_centers") or build_trial_centers(province, city, hospital)
+    geo_result = geo_match_admin(patient_info, trial_centers)
+    geo_rank = geo_result.geo_rank
+    geo_distance = geo_result.geo_distance
+    geo_match_level = geo_result.match_level
+    nearest_location = geo_result.nearest_location
+    matched_centers = geo_result.matched_centers
     if geo_rank == 0:
         base_score += 8
     elif geo_rank == 1:
@@ -452,11 +535,9 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
             if cit and normalize_text(cit) in patient_norm:
                 location_match = True
                 break
-            if prov and province_prefix_match(location, prov):
+            if prov and province_prefix_match(location, prov, patient_info=patient_info):
                 location_match = True
                 break
-
-    nearest_location = find_nearest_location(location, province, city)
 
     patient_semantic_text = " ".join(
         str(v)
@@ -612,6 +693,8 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
         'match_mode': mode,
         'geo_rank': geo_rank,
         'geo_distance': geo_distance,
+        'geo_match_level': geo_match_level,
+        'matched_centers': matched_centers,
         'nearest_location': nearest_location,
         'semantic_score': semantic_score,
         'score': base_score,
@@ -624,6 +707,7 @@ def match_trial(patient: Dict, trial: Dict, match_mode: str = "strict") -> Dict:
 def rank_trials(
     patient: Dict, trials: List[Dict], top_n: int = 20, match_mode: str = "strict"
 ) -> List[Dict]:
+    ensure_patient_location_info(patient)
     matched = []
     for trial in trials:
         result = match_trial(patient, trial, match_mode=match_mode)
@@ -730,7 +814,8 @@ def rank_trials_with_vector(
     Returns:
         按融合分数排序的试验列表，包含规则分数和向量分数
     """
-    
+    ensure_patient_location_info(patient)
+
     # 1. 向量检索：获取语义相似的候选试验
     patient_text = " ".join(
         str(v)
